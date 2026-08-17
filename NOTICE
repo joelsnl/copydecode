@@ -1,0 +1,14 @@
+copydecode
+Copyright (c) 2026 Joel Sunil
+
+The software in this repository is licensed under the GNU Affero
+General Public License v3.0 or later. See LICENSE.
+
+HuaEPUB (https://github.com/joelsnl/HuaEPUB) is a separate program
+with its own novel-specific polish. It does not import this package.
+
+Commercial licensing
+--------------------
+A separate proprietary license may be available from the copyright
+holder when AGPL compliance is not possible. There is no published
+price list. Ask via https://github.com/joelsnl/copydecode

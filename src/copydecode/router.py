@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 from copydecode.detect import CJK_RE, foreign_script_ratio
-from copydecode.epub_io import Segment
+from copydecode.document import SKIP_LLM_TAGS, Segment
 from copydecode.glossary import Glossary
 
 BOILERPLATE_RE = re.compile(
@@ -76,6 +76,8 @@ def needs_llm(
     glossary: Glossary | None = None,
 ) -> bool:
     if is_boilerplate(segment.text):
+        return False
+    if segment.tag in SKIP_LLM_TAGS:
         return False
     threshold = skip_threshold(skip_mode)
     if threshold <= 0:

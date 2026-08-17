@@ -9,18 +9,18 @@ from rich.console import Console
 from rich.table import Table
 
 from copydecode import __version__
+from copydecode.document import default_output_path, detect_format, normalize_format
 from copydecode.engine import EngineError, EngineInfo, LLMEngine, discover_engine, list_models, pick_model
-from copydecode.epub_io import load_epub
 from copydecode.hardware import clamp_for_model, detect_device, estimate_params_b, is_reasoning_model, recommended_serve_commands
+from copydecode.io import load_document
 from copydecode.pipeline import JobConfig, build_glossary, run_job
 from copydecode.serve import plan_serve, start_llama_server, stop_server
 
 console = Console()
 
 
-def default_output(input_path: Path, mode: str) -> Path:
-    suffix = "en" if mode == "translate" else "polished"
-    return input_path.with_name(f"{input_path.stem}.{suffix}.epub")
+def default_output(input_path: Path, mode: str, fmt: str | None = None) -> Path:
+    return default_output_path(input_path, mode, fmt)
 
 
 def add_common_llm_args(parser: argparse.ArgumentParser) -> None:
@@ -40,14 +40,21 @@ def add_common_llm_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="copydecode",
-        description="Local KEEP/REPLACE copy-edit and any-language→English translation for EPUBs.",
+        description="Local KEEP/REPLACE copy-edit and any-language→English translation.",
     )
     parser.add_argument("--version", action="version", version=f"copydecode {__version__}")
     sub = parser.add_subparsers(dest="command")
 
-    run = sub.add_parser("run", help="Translate to English or polish English MTL into a new EPUB")
-    run.add_argument("input", type=Path, help="Source EPUB")
-    run.add_argument("-o", "--output", type=Path, help="Output EPUB path")
+    run = sub.add_parser("run", help="Translate to English or polish English MTL")
+    run.add_argument("input", type=Path, help="Source file: epub, pdf, txt, md, html, docx, json, jsonl")
+    run.add_argument("-o", "--output", type=Path, help="Output path")
+    run.add_argument(
+        "-f",
+        "--format",
+        dest="output_format",
+        default="",
+        help="Output type: epub, pdf, txt, md, html, docx, json, jsonl. Default: same as the input.",
+    )
     run.add_argument(
         "--mode",
         choices=["auto", "polish", "translate"],
@@ -60,8 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--style", default="", help="Extra style instructions")
     run.add_argument("--max-chars", type=int, default=0, help="Chunk size. 0 = hardware default")
     run.add_argument("--retries", type=int, default=2)
-    run.add_argument("--from-chapter", type=int, default=1)
-    run.add_argument("--to-chapter", type=int, default=0, help="0 = last")
+    run.add_argument("--from-chapter", type=int, default=1, help="First section (EPUB chapter / PDF page with text / Markdown H1), 1-based")
+    run.add_argument("--to-chapter", type=int, default=0, help="Last section. 0 = last")
     run.add_argument("--state-dir", type=Path)
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--clean", action="store_true")
@@ -83,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--changelog",
         action="store_true",
-        help="Write before/after .changes.md and .changes.json next to the EPUB",
+        help="Write before/after .changes.md and .changes.json next to the output",
     )
     run.add_argument(
         "--checkpoint",
@@ -119,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common_llm_args(run)
 
-    gloss = sub.add_parser("glossary", help="Build a glossary JSON from an EPUB")
+    gloss = sub.add_parser("glossary", help="Build a glossary JSON from a document")
     gloss.add_argument("input", type=Path)
     gloss.add_argument("-o", "--output", type=Path)
     gloss.add_argument("--glossary", type=Path)
@@ -251,6 +258,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.input.exists():
         console.print(f"[red]File not found:[/red] {args.input}")
         return 1
+    try:
+        detect_format(args.input)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 1
+    out_fmt = None
+    if args.output_format:
+        try:
+            out_fmt = normalize_format(args.output_format)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return 1
     profile, info = connect(args, auto_serve=True)
     model = resolve_model(info, profile, args.model, args.allow_reasoning)
     profile = clamp_for_model(profile, model)
@@ -275,7 +294,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         num_ctx=profile.num_ctx,
         timeout=args.timeout,
     )
-    output = args.output or default_output(args.input, "translate" if args.mode == "translate" else "polish")
+    output = args.output or default_output(
+        args.input,
+        "translate" if args.mode == "translate" else "polish",
+        out_fmt,
+    )
     config = JobConfig(
         input_path=args.input,
         output_path=output,
@@ -308,6 +331,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         speculate=not args.no_speculate,
         learned_tagger=not args.no_learned_tagger,
         update_tagger=not args.no_update_tagger,
+        output_format=out_fmt or "",
     )
     try:
         run_job(config, client, profile)
@@ -324,7 +348,7 @@ def cmd_glossary(args: argparse.Namespace) -> int:
     model = resolve_model(info, profile, args.model, allow_reasoning=False)
     profile = clamp_for_model(profile, model)
     client = LLMEngine(info, model=model, temperature=args.temperature, num_ctx=profile.num_ctx, timeout=args.timeout)
-    _book, chapters = load_epub(str(args.input))
+    doc = load_document(args.input)
     config = JobConfig(
         input_path=args.input,
         output_path=args.input,
@@ -338,7 +362,7 @@ def cmd_glossary(args: argparse.Namespace) -> int:
         timeout=args.timeout,
     )
     try:
-        build_glossary(config, chapters, client)
+        build_glossary(config, doc.chapters, client)
     finally:
         client.close()
     return 0
@@ -388,7 +412,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         log=lambda msg: console.print(msg),
     )
     console.print(f"[green]llama.cpp[/green] {handle.host}  ·  {handle.alias}")
-    console.print(f"Then: copydecode document.epub --engine llamacpp --host {handle.host}")
+    console.print(f"Then: copydecode FILE --engine llamacpp --host {handle.host}")
     if args.detach or handle.proc is None:
         return 0
     console.print("[dim]Leave this window open. Ctrl+C stops the server.[/dim]")
@@ -508,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_eval_log(args)
         if args.command == "export-kd":
             return cmd_export_kd(args)
-    except (EngineError, RuntimeError, json.JSONDecodeError) as exc:
+    except (EngineError, RuntimeError, json.JSONDecodeError, ValueError, FileNotFoundError) as exc:
         console.print(f"[red]{exc}[/red]")
         return 1
     return 0

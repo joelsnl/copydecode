@@ -14,10 +14,11 @@ from copydecode.checkpoint import Checkpoint, file_fingerprint
 from copydecode.changelog import ChangeLog
 from copydecode.chunking import format_numbered, pack_segments
 from copydecode.detect import detect_mode, sample_text
+from copydecode.document import Chapter
 from copydecode.engine import LLMEngine
-from copydecode.epub_io import Chapter, load_epub, write_epub
 from copydecode.glossary import Glossary, glossary_from_data, load_glossary_file
 from copydecode.hardware import DeviceProfile
+from copydecode.io import load_document, write_document
 from copydecode.mt_firstpass import draft_translate, nllb_available, unload_nllb
 from copydecode.prompts import (
     GLOSSARY_SYSTEM,
@@ -79,6 +80,7 @@ class JobConfig:
     speculate: bool = True
     learned_tagger: bool = True
     update_tagger: bool = True
+    output_format: str = ""
 
 
 def default_chunk_size(model: str, fallback: int = 900) -> int:
@@ -708,10 +710,11 @@ def _process_chapter_copydecode(
 
 
 def run_job(config: JobConfig, client: LLMEngine, profile: DeviceProfile) -> Path:
-    book, chapters = load_epub(str(config.input_path))
+    doc = load_document(config.input_path)
+    chapters = doc.chapters
     work = selectable_chapters(chapters)
     if not work:
-        raise RuntimeError("No readable chapter text was found in this EPUB.")
+        raise RuntimeError("No readable text was found in this file.")
 
     sample = sample_text(seg.text for ch in work for seg in ch.segments)
     mode = config.mode if config.mode != "auto" else detect_mode(sample)
@@ -916,12 +919,11 @@ def run_job(config: JobConfig, client: LLMEngine, profile: DeviceProfile) -> Pat
                     progress.update(task, description=chapter.title[:40])
                     progress.advance(task, stepped)
 
-    write_epub(
-        book,
-        chapters,
-        str(config.output_path),
+    write_document(
+        doc,
+        config.output_path,
         rewrite_ids={ch.item_id for ch in chosen},
-        source_path=str(config.input_path),
+        fmt=config.output_format or None,
     )
     console.print(f"[green]Wrote[/green] {config.output_path}")
     if changes is not None:

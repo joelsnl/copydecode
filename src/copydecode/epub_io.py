@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import html
 import uuid
 import zipfile
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 from ebooklib import ITEM_DOCUMENT, epub
+
+from copydecode.document import Chapter, Document, Segment
 
 BLOCK_TAGS = {
     "p",
@@ -29,28 +31,6 @@ BLOCK_TAGS = {
 SKIP_NAME_RE = ("nav", "toc", "ncx", "cover", "contents")
 
 
-@dataclass
-class Segment:
-    item_id: str
-    index: int
-    text: str
-    tag: str
-
-    @property
-    def sid(self) -> str:
-        return f"{self.item_id}:{self.index}"
-
-
-@dataclass
-class Chapter:
-    item_id: str
-    href: str
-    title: str
-    soup: Any
-    segments: list[Segment] = field(default_factory=list)
-    skip: bool = False
-
-
 def _looks_like_nav(item: epub.EpubItem) -> bool:
     name = (item.get_name() or item.get_id() or "").lower()
     return any(token in name for token in SKIP_NAME_RE)
@@ -70,9 +50,7 @@ def parse_item_html(raw: bytes) -> BeautifulSoup:
     return BeautifulSoup(raw, "html.parser")
 
 
-def extract_segments(item: epub.EpubItem) -> tuple[BeautifulSoup, list[Segment]]:
-    raw = item.get_content()
-    soup = parse_item_html(raw)
+def extract_soup_segments(soup: BeautifulSoup, item_id: str) -> list[Segment]:
     body = soup.body or soup
     segments: list[Segment] = []
     index = 0
@@ -83,11 +61,16 @@ def extract_segments(item: epub.EpubItem) -> tuple[BeautifulSoup, list[Segment]]
         if len(text) < 2:
             continue
         segments.append(
-            Segment(item_id=item.get_id(), index=index, text=text, tag=el.name)
+            Segment(item_id=item_id, index=index, text=text, tag=el.name)
         )
         el["data-np-id"] = str(index)
         index += 1
-    return soup, segments
+    return segments
+
+
+def extract_segments(item: epub.EpubItem) -> tuple[BeautifulSoup, list[Segment]]:
+    soup = parse_item_html(item.get_content())
+    return soup, extract_soup_segments(soup, item.get_id())
 
 
 def apply_segments(soup: BeautifulSoup, rewritten: dict[int, str]) -> bytes:
@@ -261,7 +244,7 @@ def write_epub(
 
     dest = Path(output)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if source_path and Path(source_path).exists():
+    if source_path and Path(source_path).exists() and updates:
         try:
             write_zip_roundtrip(source_path, dest, updates)
             return
@@ -269,6 +252,71 @@ def write_epub(
             pass
 
     sanitize_toc(book)
+    tmp = dest.with_name(dest.name + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    epub.write_epub(str(tmp), book)
+    tmp.replace(dest)
+
+
+def load_epub_document(path: Path) -> Document:
+    book, chapters = load_epub(str(path))
+    title = ""
+    try:
+        titles = book.get_metadata("DC", "title")
+        if titles:
+            title = str(titles[0][0])
+    except (KeyError, IndexError, TypeError):
+        title = ""
+    return Document(
+        path=path,
+        fmt="epub",
+        chapters=chapters,
+        payload=book,
+        title=title or path.stem,
+    )
+
+
+def _segment_html(seg: Segment) -> str:
+    tag = seg.tag if seg.tag in BLOCK_TAGS else "p"
+    if tag == "div":
+        tag = "p"
+    body = "<br/>".join(html.escape(part) for part in seg.text.split("\n"))
+    return f"<{tag}>{body}</{tag}>"
+
+
+def write_fresh_epub(chapters: list[Chapter], output: Path, title: str) -> None:
+    book = epub.EpubBook()
+    book.set_identifier(str(uuid.uuid4()))
+    book.set_title(title or "copydecode")
+    book.set_language("en")
+    spine: list[Any] = ["nav"]
+    toc: list[Any] = []
+    for i, chapter in enumerate(chapters):
+        if chapter.skip or not chapter.segments:
+            continue
+        name = f"chap_{i:04d}.xhtml"
+        item = epub.EpubHtml(
+            title=chapter.title or f"Section {i + 1}",
+            file_name=name,
+            lang="en",
+            uid=chapter.item_id or f"ch{i}",
+        )
+        inner = "\n".join(_segment_html(seg) for seg in chapter.segments)
+        item.content = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>'
+            f"{html.escape(chapter.title or '')}</title></head><body>{inner}</body></html>"
+        )
+        book.add_item(item)
+        spine.append(item)
+        toc.append(item)
+    book.toc = toc
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = spine
+    dest = Path(output)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".tmp")
     if tmp.exists():
         tmp.unlink()
