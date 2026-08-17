@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from copydecode.epub_io import Segment
+from copydecode.document import Segment
 
 
 def split_oversized(text: str, max_chars: int) -> list[str]:
