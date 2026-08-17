@@ -140,3 +140,77 @@ PDF limits, because people will assume otherwise:
 - If you care about layout, write `--format txt` or `--format docx` and put the text wherever it actually belongs.
 
 `--from-chapter` / `--to-chapter` index extractable sections: EPUB documents, PDF pages that had text, Markdown `H1`s, DOCX Heading 1s. They are not “PDF page 12” if pages 1–11 were blank image covers.
+
+## Research and credits
+
+copydecode is not a paper implementation. The KEEP/REPLACE stitch, the skip gate, and the “do not regenerate the whole paragraph” rule came out of reading inference, editing, and literary-MT work and then throwing away anything that needed a second 14B on a 12 GB card.
+
+None of the authors below endorsed this repo. Mistakes in how the ideas were simplified are mine.
+
+### Editing instead of rewriting
+
+These are why the model is not asked to rewrite the page.
+
+- **Copy-as-Decode** (arXiv:2604.18170, 2026). Copy spans with parallel prefill instead of autoregressing tokens that already sit in the input. The KEEP path is a cheap version of that idea: stitch the source text, decode only REPLACE.
+- **LaserTagger** — Malmi et al., EMNLP 2019. KEEP / DELETE / INSERT as tagging; the feed-forward variant was reported ~100× faster than seq2seq BERT.
+- **GECToR** — Omelianchuk et al., BEA 2020. Iterative token-level edit tags on an encoder.
+- **Seq2Edits** — Stahlberg and Kumar, EMNLP 2020. Span-level copy/replace; GEC time scales with edits, not target length (up to 5.2×).
+- **PIE** — Awasthi et al., 2019. Parallel iterative editing.
+- **FELIX** — Mallinson et al., 2020. Non-autoregressive tag-and-insert.
+- **Levenshtein Transformer** — Gu et al., NeurIPS 2019. Parallel insert/delete/placeholder.
+- **Alhafni et al., ACL 2025.** Induce edit tags from bitext instead of a hand-written English morphology inventory.
+- **HyperEdit** — ACL 2026 findings. Local edits under instruction, not full regeneration.
+- **PoCO** — EMNLP 2025. LLMs over-correct; a second pass restores precision. Same shape as a high-recall dirty-span pass plus a conservative gate.
+- **MQM-APE** (2024). Keep an error span only if editing it actually helps.
+- **LaSEr-Edit** (2024) and **Ki and Carpuat (2024)**. Span-level localization for post-editing.
+- **Multi-pass decoding for GEC** — EMNLP 2024. Iterative refine with an early stop, not infinite rewrite.
+
+### Inference: do not pay AR cost for copied tokens
+
+- **Speculative sampling** — Leviathan et al., ICML 2023; Chen et al., 2023. Draft-then-verify; rejection sampling is lossless vs the target model.
+- **Prompt Lookup Decoding** — Saxena, 2023 (Hugging Face / vLLM n-gram). Draft by copying n-grams from the prompt. MTL polish is the textbook overlap case.
+- **REST** — He et al., NAACL 2024. Retrieval drafts from an n-gram store (a previous volume of the same novel is a better store than the web).
+- **Blockwise parallel decoding** — Stern et al., 2018. Extra heads predict a block, then verify. Ancestor of Medusa.
+- **Medusa** — Cai et al., ICML 2024. Extra LM heads + tree attention (~2.2–2.8×).
+- **Lookahead Decoding** — Fu et al., ICML 2024. No draft model; Jacobi n-gram window.
+- **EAGLE / EAGLE-2 / EAGLE-3** — Li et al.; EAGLE-3 NeurIPS 2025, up to ~6.5× with multi-layer feature fusion.
+- **HCSpec** — Zhang et al., ACL 2026. Position-specialized draft cascade; 15–30% over EAGLE-3 in their setup.
+- **LayerSkip** — Elhoushi et al., ACL 2024. Early layers draft, remaining layers verify. Fits a 12 GB card because there is no second model.
+- **CLaSp** — ACL 2025. Training-free in-context layer skip as the draft (~1.3–1.7×).
+- **CLLMs** — Kou et al., ICML 2024. Jacobi parallel decode trained toward the AR fixed point. Initializing that state with the MTL is the polish-shaped version.
+- **Fast-dLLM / Fast-dLLM v2** — Wu et al., 2025 (NVIDIA). KV cache + confidence-parallel unmasking on diffusion LMs; v2 adapts Qwen2.5 with ~1B finetune tokens.
+- **LLaDA** (Nie et al.) and **Dream** (Ye et al.); **LLaDA2.1** token editing (2026); **Mercury** (Inception Labs, 2025); **dParallel**. Parallel / diffusion generation; theoretically “inpaint the bad spans,” not chat.
+- **UNISPEC** — ACL 2026. Training-free speculative decoding across languages.
+- **DistillSpec**, **Draft & Verify** (Zhang et al., 2023). Distill a small draft, or skip layers as the draft.
+- **QLoRA** — Dettmers et al., 2023; **LoRA** — Hu et al., 2021. How you would actually train a 3B KEEP-biased student on a 4070.
+
+llama.cpp, vLLM, SGLang, CTranslate2, and Ollama are the engines those algorithms run on. This repo talks HTTP to whatever is listening; it does not reimplement EAGLE.
+
+### Literary translation and “what polish even does”
+
+- **Tan et al., ACL 2026.** *What Does LLM Refinement Actually Improve?* Document-level MT, then **segment-level** general refine. Fluency / style / terminology move; adequacy barely does. A fourth polish pass is mostly wasted. Keep the source in the prompt; monolingual rewrite drifts meaning.
+- **Karpinska and Iyyer, 2023.** Paragraph-level literary MT beats isolated sentences.
+- **Source-primed multi-turn document MT** — EMNLP 2025 findings. Prime with the full source, then translate as conversation turns (KV cache reuse).
+- **Incremental decoding for discourse-level literary MT** — WMT 2024, Chinese–English constrained track.
+- **TRANS-GRAPH** — EACL 2026. Condition a chunk on a small discourse neighbourhood, not the entire prefix.
+- **Sequence-level knowledge distillation** — Kim and Rush, EMNLP 2016. Train students on teacher generations. The 14B should write the corpus; DeepSeek-R1 thinking traces should not.
+- **NLLB-200** (NLLB Team / Meta) and **MADLAD-400**. Optional CTranslate2 first pass when the file is still Chinese.
+
+### Tools and write-ups that were useful while scoping the problem
+
+Not citations of code copied in. Things I looked at so I would not reinvent a bad EPUB loop:
+
+TranslateBookWithLLM (hydropix), ebook_translater (liaozensiang), translate-book (DDChen666), BiTranslator (eveshi), Wenyi (AlexbeatsZ), epublate (madpin), Itranslation (Yisan0429), and TeaNovel’s comparison of chapter-level MTL tools (honorifics and glossary drift).
+
+### What this repo actually took
+
+| Idea | From | What shipped |
+| --- | --- | --- |
+| Do not regenerate KEEP tokens | Copy-as-Decode; LaserTagger; Seq2Edits | Span tags + stitch |
+| Skip spans that are already fine | GECToR-style tagging; MQM-APE; PoCO | Heuristic skip + quality gate |
+| Terms are a string replace, not a prompt | glossary / constrained MT practice | `--glossary` FST-style apply |
+| Doc draft, sentence polish | Tan et al. 2026 | Chapter/section windows, not one giant rewrite |
+| No reasoning model at inference | every latency paper vs R1 | never auto-select R1/QwQ |
+| Hardware clamp | obvious, plus LayerSkip’s “no second model” | `copydecode devices` |
+
+If a paper’s numbers appear in git history or a canvas note, they are the authors’ published figures, not a benchmark I ran on your novel.
