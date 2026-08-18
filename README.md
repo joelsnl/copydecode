@@ -143,11 +143,8 @@ texts, model = copydecode.polish_paragraphs(
 
 Everything intentional raises a `copydecode.CopydecodeError` subclass (`EngineError` for server trouble, `DocumentError` for file trouble). A raw traceback from anything else is a bug — file it with the traceback, not a screenshot.
 
-**Publishing to PyPI** is Trusted Publishing from `.github/workflows/publish.yml`, triggered by a GitHub Release (or `workflow_dispatch`). There is no API token in this repo. Before the first upload, a human has to:
+**Publishing to PyPI** is Trusted Publishing from `.github/workflows/publish.yml`. Pushing a `v*` tag (or `workflow_dispatch`) builds the wheel on GitHub and uploads it. PyPI does not clone the repo; it stores that wheel. There is no API token in this repo.
 
-1. Create a PyPI account and 2FA.
-2. Register a pending publisher at https://pypi.org/manage/account/publishing/ — owner `joelsnl`, repo `copydecode`, workflow `publish.yml`, environment `pypi`.
-3. Create a GitHub Environment named `pypi` on this repo (required reviewers are optional but worth turning on).
-4. Push, then cut a GitHub Release whose tag matches `pyproject.toml` (`v0.3.0` is fine).
+First-time setup: PyPI account + 2FA, pending publisher (`joelsnl` / `copydecode` / `publish.yml` / environment `pypi`), GitHub Environment named `pypi`. After that: `git tag v0.3.1 && git push origin v0.3.1`.
 
 License: **AGPL-3.0-or-later**. Private use anywhere, including at work, is unconditionally fine. Distribution or network services built on modified versions owe source under the AGPL. Commercial exceptions: open a GitHub issue titled `Commercial license`.
