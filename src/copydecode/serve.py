@@ -18,6 +18,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 from rich.console import Console
@@ -32,22 +33,33 @@ USER_AGENT = "copydecode"
 DEFAULT_PORT = 8080
 DEFAULT_HOST = "http://127.0.0.1:8080"
 
-# Official Qwen2.5 Instruct Q4_K_M GGUFs. Size picks follow hardware caps.
+class GgufSpec(NamedTuple):
+    alias: str
+    filename: str
+    url: str
+    sha256: str
+
+
+# Single-file Q4_K_M GGUFs with pinned sha256. Official Qwen 7B/14B uploads are
+# sharded, so those sizes come from bartowski; 3B is the official Qwen file.
 HF_GGUF = {
-    14: (
+    14: GgufSpec(
         "qwen2.5:14b",
-        "qwen2.5-14b-instruct-q4_k_m.gguf",
-        "https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/main/qwen2.5-14b-instruct-q4_k_m.gguf",
+        "Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+        "https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+        "e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008",
     ),
-    7: (
+    7: GgufSpec(
         "qwen2.5:7b",
-        "qwen2.5-7b-instruct-q4_k_m.gguf",
-        "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf",
+        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+        "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+        "65b8fcd92af6b4fefa935c625d1ac27ea29dcb6ee14589c55a8f115ceaaa1423",
     ),
-    3: (
+    3: GgufSpec(
         "qwen2.5:3b",
         "qwen2.5-3b-instruct-q4_k_m.gguf",
         "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+        "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d",
     ),
 }
 
@@ -110,8 +122,8 @@ def pid_path() -> Path:
     return cache_dir() / "llama-server.pid"
 
 
-def gguf_choice(profile: DeviceProfile) -> tuple[str, str, str]:
-    """(alias, filename, url) of the largest bundled Qwen2.5 that fits the hardware."""
+def gguf_choice(profile: DeviceProfile) -> GgufSpec:
+    """Largest bundled Qwen2.5 Q4_K_M that fits the hardware."""
     if profile.max_params_b >= 12:
         return HF_GGUF[14]
     if profile.max_params_b >= 7:
@@ -179,26 +191,26 @@ def find_local_gguf(filename: str) -> Path | None:
 
 
 def resolve_gguf(profile: DeviceProfile, *, download: bool, log: Log = _noop_log) -> tuple[Path, str]:
-    alias, filename, url = gguf_choice(profile)
-    log(f"Looking for {alias} GGUF (disk cache, then Ollama blobs — no ollama.exe)…")
-    local = find_local_gguf(filename)
+    spec = gguf_choice(profile)
+    log(f"Looking for {spec.alias} GGUF (disk cache, then Ollama blobs — no ollama.exe)…")
+    local = find_local_gguf(spec.filename)
     if local:
         log(f"Using GGUF {local}")
-        return local, alias
-    blob = find_ollama_blob(alias)
-    params = estimate_params_b(alias)
+        return local, spec.alias
+    blob = find_ollama_blob(spec.alias)
+    params = estimate_params_b(spec.alias)
     if blob and params is not None and params <= profile.max_params_b + 0.2:
-        log(f"Reusing Ollama blob for {alias}: {blob}")
-        return blob, alias
+        log(f"Reusing Ollama blob for {spec.alias}: {blob}")
+        return blob, spec.alias
     if not download:
         raise EngineError(
-            f"No GGUF for {alias}. Place {filename} in {cache_dir() / 'models'} "
+            f"No GGUF for {spec.alias}. Place {spec.filename} in {cache_dir() / 'models'} "
             "or set COPYDECODE_GGUF, or run without --no-download."
         )
-    dest = cache_dir() / "models" / filename
-    log(f"Downloading {filename} from Hugging Face…")
-    download_file(url, dest, log=log)
-    return dest, alias
+    dest = cache_dir() / "models" / spec.filename
+    log(f"Downloading {spec.filename} from Hugging Face…")
+    download_file(spec.url, dest, log=log, expected_sha256=spec.sha256)
+    return dest, spec.alias
 
 
 def binary_preferences(profile: DeviceProfile) -> list[str]:
@@ -374,19 +386,43 @@ def download_file(url: str, dest: Path, log: Log = _noop_log, *, expected_sha256
     log(f"Saved {dest} ({dest.stat().st_size / (1024 * 1024):.1f} MB)")
 
 
+def _member_inside(dest: Path, name: str) -> Path:
+    """Return the resolved extract path, or raise if `name` escapes `dest`."""
+    cleaned = name.replace("\\", "/")
+    if cleaned.startswith("/") or cleaned.startswith("../") or "/../" in f"/{cleaned}/":
+        raise EngineError(f"Refusing archive member {name!r}: path escapes {dest}")
+    if re.match(r"^[A-Za-z]:", cleaned):
+        raise EngineError(f"Refusing archive member {name!r}: absolute path")
+    dest_r = dest.resolve()
+    target = (dest_r / cleaned).resolve()
+    try:
+        target.relative_to(dest_r)
+    except ValueError as exc:
+        raise EngineError(f"Refusing archive member {name!r}: path escapes {dest_r}") from exc
+    return target
+
+
 def _extract(archive: Path, dest: Path) -> None:
+    dest = dest.resolve()
     dest.mkdir(parents=True, exist_ok=True)
     name = archive.name.lower()
     if name.endswith(".zip"):
         with zipfile.ZipFile(archive) as zf:
+            for info in zf.infolist():
+                _member_inside(dest, info.filename)
             zf.extractall(dest)
         return
     with tarfile.open(archive) as tf:
         try:
             tf.extractall(dest, filter="data")
+            return
         except TypeError:
-            # Python < 3.12 has no extraction filters.
-            tf.extractall(dest)
+            pass
+        for member in tf.getmembers():
+            if member.issym() or member.islnk():
+                raise EngineError(f"Refusing tar link {member.name!r}")
+            _member_inside(dest, member.name)
+        tf.extractall(dest)
 
 
 def _make_executable(path: Path) -> None:
@@ -423,6 +459,10 @@ def install_llama_server(profile: DeviceProfile, *, download: bool, log: Log = _
     log(f"Downloading llama.cpp {tag} / {chosen}")
     archive = cache_dir() / "downloads" / chosen
     url, sha = assets[chosen]
+    if not sha:
+        raise EngineError(
+            f"GitHub asset {chosen} has no sha256 digest. Refusing to install an unverified binary."
+        )
     download_file(url, archive, log=log, expected_sha256=sha)
     _extract(archive, out_dir)
     extra = cudart_asset_for(chosen)
@@ -430,6 +470,10 @@ def install_llama_server(profile: DeviceProfile, *, download: bool, log: Log = _
         log(f"Downloading CUDA runtime {extra}")
         rt = cache_dir() / "downloads" / extra
         rt_url, rt_sha = assets[extra]
+        if not rt_sha:
+            raise EngineError(
+                f"GitHub asset {extra} has no sha256 digest. Refusing to install an unverified binary."
+            )
         download_file(rt_url, rt, log=log, expected_sha256=rt_sha)
         _extract(rt, out_dir)
     exe = find_llama_server(out_dir)
@@ -672,7 +716,7 @@ def start_llama_server(
     host = f"http://127.0.0.1:{port}"
     if server_running(host):
         log(f"llama.cpp already listening on {host}")
-        alias, filename, _url = gguf_choice(profile)
+        alias, filename, _url, _sha = gguf_choice(profile)
         gguf = find_local_gguf(filename) or Path(filename)
         exe = find_llama_server() or Path("llama-server")
         return LlamaHandle(host=host, alias=alias, gguf=gguf, exe=exe, proc=None, args=[])
@@ -717,9 +761,9 @@ def start_llama_server(
 
 
 def plan_serve(profile: DeviceProfile) -> dict[str, str]:
-    alias, filename, url = gguf_choice(profile)
-    blob = find_ollama_blob(alias)
-    local = find_local_gguf(filename)
+    spec = gguf_choice(profile)
+    blob = find_ollama_blob(spec.alias)
+    local = find_local_gguf(spec.filename)
     exe = find_llama_server()
     return {
         "os": f"{platform.system()} {platform.machine()}",
@@ -728,8 +772,8 @@ def plan_serve(profile: DeviceProfile) -> dict[str, str]:
         "vendor": profile.vendor,
         "binary": ", ".join(binary_preferences(profile)[:3]),
         "llama-server": str(exe) if exe else "(will download from GitHub)",
-        "gguf": str(local or blob or f"(will download {filename})"),
-        "hf": url,
-        "alias": alias,
+        "gguf": str(local or blob or f"(will download {spec.filename})"),
+        "hf": spec.url,
+        "alias": spec.alias,
         "cache": str(cache_dir()),
     }

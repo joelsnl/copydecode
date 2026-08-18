@@ -9,7 +9,9 @@ from unittest.mock import MagicMock, patch
 from copydecode.engine import EngineError
 from copydecode.hardware import DeviceProfile
 from copydecode.serve import (
+    HF_GGUF,
     ServerLog,
+    _extract,
     binary_preferences,
     build_server_args,
     cudart_asset_for,
@@ -102,12 +104,18 @@ class BinaryPreferenceTests(unittest.TestCase):
 
 class GuffAndOllamaTests(unittest.TestCase):
     def test_gguf_follows_vram_cap(self) -> None:
-        alias, filename, url = gguf_choice(_profile(max_params_b=14.0))
-        self.assertEqual(alias, "qwen2.5:14b")
-        self.assertIn("14b", filename)
-        self.assertTrue(url.startswith("https://huggingface.co/"))
-        alias7, _, _ = gguf_choice(_profile(max_params_b=7.0))
-        self.assertEqual(alias7, "qwen2.5:7b")
+        spec = gguf_choice(_profile(max_params_b=14.0))
+        self.assertEqual(spec.alias, "qwen2.5:14b")
+        self.assertIn("14B", spec.filename)
+        self.assertTrue(spec.url.startswith("https://huggingface.co/"))
+        self.assertEqual(len(spec.sha256), 64)
+        spec7 = gguf_choice(_profile(max_params_b=7.0))
+        self.assertEqual(spec7.alias, "qwen2.5:7b")
+
+    def test_pinned_gguf_checksums(self) -> None:
+        for spec in HF_GGUF.values():
+            self.assertEqual(len(spec.sha256), 64, spec.filename)
+            self.assertRegex(spec.sha256, r"^[0-9a-f]{64}$")
 
     def test_parse_ollama_from(self) -> None:
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
@@ -303,6 +311,34 @@ class DownloadTests(unittest.TestCase):
         assets = release_assets(release)
         self.assertEqual(assets["llama-b1-bin-win-cpu-x64.zip"], ("https://example.invalid/b1.zip", "a" * 64))
         self.assertEqual(assets["no-digest.zip"], ("https://example.invalid/n.zip", ""))
+
+
+class ExtractTests(unittest.TestCase):
+    def test_zip_extracts_plain_member(self) -> None:
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "ok.zip"
+            dest = root / "out"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr("llama-server.exe", b"not-really")
+            _extract(archive, dest)
+            self.assertTrue((dest / "llama-server.exe").is_file())
+
+    def test_zip_slip_is_rejected(self) -> None:
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "evil.zip"
+            dest = root / "out"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr("../outside.txt", b"nope")
+            with self.assertRaises(EngineError) as ctx:
+                _extract(archive, dest)
+            self.assertIn("escapes", str(ctx.exception))
+            self.assertFalse((root / "outside.txt").exists())
 
 
 if __name__ == "__main__":

@@ -60,7 +60,7 @@ Read this before your first bug report. None of these are hidden; they are trade
 **Download machinery**
 
 - `serve.py` hardcodes three Qwen2.5 GGUF URLs (3B/7B/14B Q4_K_M) and matches GitHub release assets by literal filename suffixes, including CUDA/ROCm version strings (`cuda-12.4`, `cuda-13.3`, `rocm-7.2`). These strings **will** rot when llama.cpp renames its artifacts, and only a human will notice.
-- Downloads resume via Range requests and verify sha256 **only when GitHub publishes a digest**. The multi-GB Hugging Face GGUF is not checksum-verified — a truncated stream raises, a corrupted-at-source file would not.
+- Downloads resume via Range requests. llama.cpp GitHub assets are sha256-verified and **refused** if the release has no digest. The three bundled GGUFs are pinned to known hashes; a truncated or swapped file fails closed. The 7B and 14B files come from bartowski because the official Qwen uploads of those sizes are sharded and this tool does not stitch shards.
 - Hardware sizing (`hardware.py`) is a table of VRAM tiers and name-regex parameter guessing. A model whose size is not in its name gets conservative defaults and a shrug.
 
 **Concurrency**
@@ -77,15 +77,16 @@ Read this before your first bug report. None of these are hidden; they are trade
 
 ## Setup & Local Running
 
-Requirements: Python ≥ 3.10. A GPU if you want the LLM steps to finish this week. First run downloads a llama.cpp build (tens–hundreds of MB) plus a Qwen2.5 GGUF (**2–9 GB** depending on your VRAM) unless you point it at a server you already run.
+Requirements: Python ≥ 3.10. A GPU if you want the LLM steps to finish this week. First run of `copydecode serve` downloads a llama.cpp build (tens–hundreds of MB) plus a Qwen2.5 GGUF (**2–9 GB** depending on your VRAM) unless you point it at a server you already run.
 
 ```powershell
+pip install copydecode
+
+# or, from a clone, for hacking on it:
 git clone https://github.com/joelsnl/copydecode
 cd copydecode
 python -m pip install -e ".[dev]"
-
-# prove the offline parts work before involving a GPU
-python -m unittest discover -s tests     # 120 tests, no network, no LLM
+python -m unittest discover -s tests     # offline, no LLM
 ruff check .
 ```
 
@@ -141,5 +142,12 @@ texts, model = copydecode.polish_paragraphs(
 ```
 
 Everything intentional raises a `copydecode.CopydecodeError` subclass (`EngineError` for server trouble, `DocumentError` for file trouble). A raw traceback from anything else is a bug — file it with the traceback, not a screenshot.
+
+**Publishing to PyPI** is Trusted Publishing from `.github/workflows/publish.yml`, triggered by a GitHub Release (or `workflow_dispatch`). There is no API token in this repo. Before the first upload, a human has to:
+
+1. Create a PyPI account and 2FA.
+2. Register a pending publisher at https://pypi.org/manage/account/publishing/ — owner `joelsnl`, repo `copydecode`, workflow `publish.yml`, environment `pypi`.
+3. Create a GitHub Environment named `pypi` on this repo (required reviewers are optional but worth turning on).
+4. Push, then cut a GitHub Release whose tag matches `pyproject.toml` (`v0.3.0` is fine).
 
 License: **AGPL-3.0-or-later**. Private use anywhere, including at work, is unconditionally fine. Distribution or network services built on modified versions owe source under the AGPL. Commercial exceptions: open a GitHub issue titled `Commercial license`.

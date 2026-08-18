@@ -357,12 +357,12 @@ def recommended_serve_commands(profile: DeviceProfile) -> list[tuple[str, str]]:
     """Exact vLLM / llama.cpp flags for this machine (throughput blueprint)."""
     ctx = profile.num_ctx
     if profile.max_params_b >= 12:
-        gguf = "qwen2.5-14b-instruct-q4_k_m.gguf"
+        gguf = "Qwen2.5-14B-Instruct-Q4_K_M.gguf"
         vllm_model = "Qwen/Qwen2.5-14B-Instruct-AWQ"
         parallel = 1
         mem = "0.90"
     elif profile.max_params_b >= 7:
-        gguf = "qwen2.5-7b-instruct-q4_k_m.gguf"
+        gguf = "Qwen2.5-7B-Instruct-Q4_K_M.gguf"
         vllm_model = "Qwen/Qwen2.5-7B-Instruct-AWQ"
         parallel = 1 if profile.backend != "cuda" else 2
         mem = "0.88"
