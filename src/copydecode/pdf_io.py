@@ -1,4 +1,3 @@
-# Author: joelsnl
 """PDF extract + reflowed write. Layout, images, and original fonts are not preserved."""
 
 from __future__ import annotations
@@ -8,6 +7,7 @@ import re
 from pathlib import Path
 
 from copydecode.document import Chapter, Document, chapter_from_blocks
+from copydecode.errors import DocumentError
 
 HYPHEN_BREAK = re.compile(r"(\w)-\n(\w)")
 
@@ -37,16 +37,16 @@ def load_pdf(path: Path) -> Document:
     try:
         from pypdf import PdfReader
     except ImportError as exc:
-        raise RuntimeError("PDF support needs pypdf. Install with: pip install pypdf") from exc
+        raise DocumentError("PDF support needs pypdf. Install with: pip install pypdf") from exc
     try:
         reader = PdfReader(str(path))
     except Exception as exc:
-        raise RuntimeError(f"Could not open PDF: {exc}") from exc
+        raise DocumentError(f"Could not open PDF: {exc}") from exc
     if getattr(reader, "is_encrypted", False):
         try:
             reader.decrypt("")
         except Exception as exc:
-            raise RuntimeError("This PDF is encrypted. Decrypt it before running copydecode.") from exc
+            raise DocumentError("This PDF is encrypted. Decrypt it before running copydecode.") from exc
     meta_title = ""
     if reader.metadata and reader.metadata.title:
         meta_title = str(reader.metadata.title).strip()
@@ -65,7 +65,7 @@ def load_pdf(path: Path) -> Document:
             chapter_from_blocks(item_id, f"{path.name}#page-{i + 1}", title, blocks)
         )
     if not chapters:
-        raise RuntimeError("No extractable text in this PDF (scanned image-only PDFs are not supported).")
+        raise DocumentError("No extractable text in this PDF (scanned image-only PDFs are not supported).")
     return Document(
         path=path,
         fmt="pdf",
@@ -95,7 +95,7 @@ def write_pdf(chapters: list[Chapter], output: Path, title: str) -> None:
     try:
         from fpdf import FPDF
     except ImportError as exc:
-        raise RuntimeError("PDF output needs fpdf2. Install with: pip install fpdf2") from exc
+        raise DocumentError("PDF output needs fpdf2. Install with: pip install fpdf2") from exc
 
     font_path = _system_font()
     pdf = FPDF()

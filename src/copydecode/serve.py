@@ -1,5 +1,8 @@
+"""Download, start, and stop a local llama.cpp server matched to this machine."""
+
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -108,6 +111,7 @@ def pid_path() -> Path:
 
 
 def gguf_choice(profile: DeviceProfile) -> tuple[str, str, str]:
+    """(alias, filename, url) of the largest bundled Qwen2.5 that fits the hardware."""
     if profile.max_params_b >= 12:
         return HF_GGUF[14]
     if profile.max_params_b >= 7:
@@ -160,7 +164,7 @@ def find_ollama_blob(tag: str) -> Path | None:
 
 
 def find_local_gguf(filename: str) -> Path | None:
-    env = env_value("COPYDECODE_GGUF", "NOVELPOLISHER_GGUF")
+    env = env_value("COPYDECODE_GGUF")
     if env:
         path = Path(env)
         if path.is_file():
@@ -182,7 +186,8 @@ def resolve_gguf(profile: DeviceProfile, *, download: bool, log: Log = _noop_log
         log(f"Using GGUF {local}")
         return local, alias
     blob = find_ollama_blob(alias)
-    if blob and estimate_params_b(alias) <= profile.max_params_b + 0.2:
+    params = estimate_params_b(alias)
+    if blob and params is not None and params <= profile.max_params_b + 0.2:
         log(f"Reusing Ollama blob for {alias}: {blob}")
         return blob, alias
     if not download:
@@ -252,7 +257,7 @@ def cudart_asset_for(binary_name: str) -> str | None:
 
 
 def find_llama_server(root: Path | None = None) -> Path | None:
-    env = env_value("COPYDECODE_LLAMA_SERVER", "NOVELPOLISHER_LLAMA_SERVER")
+    env = env_value("COPYDECODE_LLAMA_SERVER")
     if env:
         path = Path(env)
         if path.is_file():
@@ -292,28 +297,79 @@ def github_latest_release(log: Log = _noop_log) -> dict:
         raise EngineError(f"Could not list llama.cpp releases: {exc}") from exc
 
 
-def download_file(url: str, dest: Path, log: Log = _noop_log) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".partial")
-    if tmp.exists():
-        tmp.unlink()
-    with httpx.Client(timeout=None, follow_redirects=True, headers=_http_headers()) as client:
+def release_assets(release: dict) -> dict[str, tuple[str, str]]:
+    """Map asset name -> (download url, sha256-or-empty) from a GitHub release."""
+    assets: dict[str, tuple[str, str]] = {}
+    for item in release.get("assets") or []:
+        name = item.get("name")
+        if not name:
+            continue
+        raw_digest = str(item.get("digest") or "")
+        sha = raw_digest.split(":", 1)[1] if raw_digest.startswith("sha256:") else ""
+        assets[str(name)] = (str(item.get("browser_download_url") or ""), sha)
+    return assets
+
+
+def _stream_download(url: str, tmp: Path, offset: int, digest, label: str, log: Log) -> None:
+    headers = _http_headers()
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
+    with httpx.Client(timeout=None, follow_redirects=True, headers=headers) as client:
         with client.stream("GET", url) as response:
+            resumed = bool(offset) and response.status_code == 206
             response.raise_for_status()
-            total = int(response.headers.get("Content-Length") or 0)
-            console = Console()
+            length = int(response.headers.get("Content-Length") or 0)
+            start = offset if resumed else 0
+            total = start + length if length else 0
+            if resumed:
+                log(f"Resuming {label} at {start / (1024 * 1024):.1f} MB")
+                with tmp.open("rb") as existing:
+                    for chunk in iter(lambda: existing.read(1 << 20), b""):
+                        digest.update(chunk)
             with Progress(
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
                 DownloadColumn(),
                 TransferSpeedColumn(),
-                console=console,
+                console=Console(),
             ) as progress:
-                task = progress.add_task(dest.name, total=total or None)
-                with tmp.open("wb") as handle:
+                task = progress.add_task(label, total=total or None, completed=start)
+                with tmp.open("ab" if resumed else "wb") as handle:
                     for chunk in response.iter_bytes(1024 * 256):
                         handle.write(chunk)
+                        digest.update(chunk)
                         progress.advance(task, len(chunk))
+
+
+def download_file(url: str, dest: Path, log: Log = _noop_log, *, expected_sha256: str = "") -> None:
+    """Stream ``url`` to ``dest``.
+
+    Interrupted downloads resume from the ``.partial`` file when the server
+    honors Range requests. When a sha256 is supplied the whole file is hashed
+    while streaming and a mismatch deletes the partial and raises.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".partial")
+    offset = tmp.stat().st_size if tmp.exists() else 0
+    digest = hashlib.sha256()
+    try:
+        _stream_download(url, tmp, offset, digest, dest.name, log)
+    except httpx.HTTPStatusError as exc:
+        if not offset or exc.response.status_code not in {400, 416}:
+            raise
+        # The partial file no longer matches what the server has; start over.
+        tmp.unlink(missing_ok=True)
+        digest = hashlib.sha256()
+        _stream_download(url, tmp, 0, digest, dest.name, log)
+    if expected_sha256:
+        actual = digest.hexdigest()
+        if actual.lower() != expected_sha256.lower():
+            tmp.unlink(missing_ok=True)
+            raise EngineError(
+                f"Checksum mismatch for {dest.name}: expected sha256 {expected_sha256}, "
+                f"got {actual}. The partial file was deleted; run again to re-download."
+            )
+        log(f"sha256 verified for {dest.name}")
     tmp.replace(dest)
     log(f"Saved {dest} ({dest.stat().st_size / (1024 * 1024):.1f} MB)")
 
@@ -326,7 +382,11 @@ def _extract(archive: Path, dest: Path) -> None:
             zf.extractall(dest)
         return
     with tarfile.open(archive) as tf:
-        tf.extractall(dest)
+        try:
+            tf.extractall(dest, filter="data")
+        except TypeError:
+            # Python < 3.12 has no extraction filters.
+            tf.extractall(dest)
 
 
 def _make_executable(path: Path) -> None:
@@ -347,7 +407,7 @@ def install_llama_server(profile: DeviceProfile, *, download: bool, log: Log = _
             "so copydecode can fetch the matching GitHub build."
         )
     release = github_latest_release(log=log)
-    assets = {item["name"]: item["browser_download_url"] for item in release.get("assets") or [] if "name" in item}
+    assets = release_assets(release)
     chosen = pick_release_asset(list(assets), binary_preferences(profile))
     if not chosen:
         raise EngineError(
@@ -362,28 +422,21 @@ def install_llama_server(profile: DeviceProfile, *, download: bool, log: Log = _
         return exe
     log(f"Downloading llama.cpp {tag} / {chosen}")
     archive = cache_dir() / "downloads" / chosen
-    download_file(assets[chosen], archive, log=log)
+    url, sha = assets[chosen]
+    download_file(url, archive, log=log, expected_sha256=sha)
     _extract(archive, out_dir)
     extra = cudart_asset_for(chosen)
     if extra and extra in assets:
         log(f"Downloading CUDA runtime {extra}")
         rt = cache_dir() / "downloads" / extra
-        download_file(assets[extra], rt, log=log)
+        rt_url, rt_sha = assets[extra]
+        download_file(rt_url, rt, log=log, expected_sha256=rt_sha)
         _extract(rt, out_dir)
     exe = find_llama_server(out_dir)
     if not exe:
         raise EngineError(f"Unpacked {chosen} but llama-server was not inside it.")
     _make_executable(exe)
     return exe
-
-
-# Do not run `llama-server -h`: CUDA builds often initialize the GPU just to print help.
-DEFAULT_SERVER_HELP = "--alias --cache-prompt --flash-attn --cont-batching --spec-type"
-
-
-def probe_help(exe: Path) -> str:
-    del exe
-    return DEFAULT_SERVER_HELP
 
 
 def build_server_args(
@@ -393,9 +446,13 @@ def build_server_args(
     *,
     alias: str,
     port: int = DEFAULT_PORT,
-    help_text: str = DEFAULT_SERVER_HELP,
+    minimal: bool = False,
 ) -> list[str]:
-    help_text = help_text or DEFAULT_SERVER_HELP
+    """llama-server argv for this hardware.
+
+    ``minimal=True`` keeps only flags every supported build understands; it is
+    the retry set when a build rejects one of the optional flags.
+    """
     ngl = 0 if profile.backend == "cpu" else 99
     parallel = 1 if profile.max_params_b >= 12 or profile.backend != "cuda" else max(1, profile.workers)
     args = [
@@ -417,16 +474,12 @@ def build_server_args(
         "--ubatch-size",
         "256",
     ]
-    if "--alias" in help_text or "-a" in help_text:
-        args.extend(["--alias", alias])
-    if "--cache-prompt" in help_text:
-        args.append("--cache-prompt")
-    if profile.backend in {"cuda", "metal"} and "--flash-attn" in help_text:
+    if minimal:
+        return args
+    args.extend(["--alias", alias, "--cache-prompt", "--cont-batching"])
+    if profile.backend in {"cuda", "metal"}:
         args.extend(["--flash-attn", "on"])
-    if "--cont-batching" in help_text:
-        args.append("--cont-batching")
-    if "--spec-type" in help_text:
-        args.extend(["--spec-type", "ngram-simple"])
+    args.extend(["--spec-type", "ngram-simple"])
     return args
 
 
@@ -513,6 +566,35 @@ def server_running(host: str = DEFAULT_HOST) -> bool:
         return False
 
 
+def _pid_name(pid: int) -> str:
+    """Best-effort executable name for a PID; empty string when unknown."""
+    try:
+        if platform.system() == "Windows":
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            ).stdout.strip()
+            if out.startswith('"'):
+                return out.split('","')[0].strip('"')
+            return ""
+        comm = Path(f"/proc/{pid}/comm")
+        if comm.exists():
+            return comm.read_text(encoding="utf-8").strip()
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        ).stdout.strip()
+        return Path(out).name if out else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def stop_server(log: Log = _noop_log) -> bool:
     path = pid_path()
     if not path.is_file():
@@ -520,6 +602,13 @@ def stop_server(log: Log = _noop_log) -> bool:
     try:
         pid = int(path.read_text(encoding="utf-8").strip())
     except ValueError:
+        path.unlink(missing_ok=True)
+        return False
+    name = _pid_name(pid)
+    if "llama-server" not in name.lower():
+        # The PID was reused by another process, or the server already exited.
+        # Killing an unverified PID is how you take down someone's browser.
+        log(f"pid {pid} is {name or 'gone'}, not llama-server; removing the stale pid file.")
         path.unlink(missing_ok=True)
         return False
     try:
@@ -597,9 +686,6 @@ def start_llama_server(
     exe = install_llama_server(profile, download=download, log=log)
     gguf, alias = resolve_gguf(profile, download=download, log=log)
     args = build_server_args(exe, gguf, profile, alias=alias, port=port)
-    stale_log = cache_dir() / "llama-server.log"
-    stale_log.unlink(missing_ok=True)
-    log("Starting llama-server")
     log("Starting: " + " ".join(args))
     if detach:
         stdout: object = subprocess.DEVNULL
@@ -616,19 +702,15 @@ def start_llama_server(
     except EngineError:
         if proc.poll() is None:
             raise
-        stripped = [
-            a
-            for a in args
-            if a not in {"--flash-attn", "on", "--spec-type", "ngram-simple", "--cont-batching"}
-        ]
-        if stripped == args:
+        minimal = build_server_args(exe, gguf, profile, alias=alias, port=port, minimal=True)
+        if minimal == args:
             raise
-        log("Retrying llama-server without optional flags…")
-        proc = _popen_server(stripped, exe.parent, detach=detach, stdout=stdout)
+        log("llama-server rejected a flag; retrying with the minimal argument set…")
+        proc = _popen_server(minimal, exe.parent, detach=detach, stdout=stdout)
         if capture is not None:
             capture.attach(proc)
         pid_path().write_text(str(proc.pid), encoding="utf-8")
-        args = stripped
+        args = minimal
         wait_healthy(host, proc=proc, capture=capture, log=log)
     log(f"llama.cpp ready at {host} ({alias})")
     return LlamaHandle(host=host, alias=alias, gguf=gguf, exe=exe, proc=proc, args=args)

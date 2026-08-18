@@ -4,11 +4,11 @@ import unittest
 
 from copydecode.glossary import Glossary, Term
 from copydecode.spans import (
-    Span,
     EditProgram,
+    Span,
     pack_span_jobs,
-    span_jobs_for,
     replacement_ok,
+    span_jobs_for,
     span_length_ok,
     split_units,
     tag_text,
@@ -39,7 +39,7 @@ class SplitUnitsTests(unittest.TestCase):
 class TagTests(unittest.TestCase):
     def test_short_trailing_keep_is_copied(self) -> None:
         text = "He could not help but smile. The valley was quiet."
-        program = tag_text(text, "polish", "auto", learned=False)
+        program = tag_text(text, "polish", "auto")
         self.assertEqual(program.stitched({}), text)
         kinds = [span.kind for span in program.spans]
         self.assertEqual(kinds, ["REPLACE", "KEEP"])
@@ -51,7 +51,7 @@ class TagTests(unittest.TestCase):
             "He could not help but smile. "
             "Then he walked toward the sect gate."
         )
-        program = tag_text(text, "polish", "auto", learned=False)
+        program = tag_text(text, "polish", "auto")
         kinds = [span.kind for span in program.spans]
         self.assertIn("REPLACE", kinds)
         self.assertIn("KEEP", kinds)
@@ -65,7 +65,7 @@ class TagTests(unittest.TestCase):
             "He sucked in a cold air. "
             "The sun rose over the valley."
         )
-        program = tag_text(text, "polish", "auto", learned=False)
+        program = tag_text(text, "polish", "auto")
         self.assertEqual(program.stitched({}), text)
         replace_text = "".join(s.text for s in program.spans if s.kind == "REPLACE")
         self.assertIn("The old path forked ahead", replace_text)
@@ -74,13 +74,13 @@ class TagTests(unittest.TestCase):
 
     def test_force_dirty_when_clean(self) -> None:
         text = "The mountain wind was cold. Then he walked toward the sect gate."
-        program = tag_text(text, "polish", "auto", force_dirty=True, learned=False)
+        program = tag_text(text, "polish", "auto", force_dirty=True)
         self.assertTrue(any(span.kind == "REPLACE" for span in program.spans))
         self.assertEqual(program.stitched({}), text)
 
     def test_skip_off_rewrites_clean_text(self) -> None:
         text = "The mountain wind was cold."
-        program = tag_text(text, "polish", "off", learned=False)
+        program = tag_text(text, "polish", "off")
         self.assertEqual(program.spans[0].kind, "REPLACE")
 
     def test_low_keep_ratio_collapses(self) -> None:
@@ -90,14 +90,14 @@ class TagTests(unittest.TestCase):
             "Incontinently the youth said in a deep voice that this daddy will "
             "already was very much so in the next moment."
         )
-        program = tag_text(text, "polish", "auto", learned=False)
+        program = tag_text(text, "polish", "auto")
         self.assertEqual(len(program.spans), 1)
         self.assertEqual(program.spans[0].kind, "REPLACE")
 
     def test_glossary_does_not_break_join(self) -> None:
         glossary = Glossary(terms=[Term("Jindan", "Golden Core")])
         text = "His Jindan broke. The mountain was quiet."
-        program = tag_text(text, "polish", "auto", glossary, learned=False)
+        program = tag_text(text, "polish", "auto", glossary)
         self.assertEqual(program.stitched({}), text)
 
 
@@ -121,7 +121,6 @@ class StitchTests(unittest.TestCase):
             "The mountain wind was cold. He could not help but smile. Then he walked on.",
             "polish",
             "auto",
-            learned=False,
         )
         jobs = span_jobs_for(3, program)
         self.assertTrue(jobs)
@@ -135,7 +134,6 @@ class StitchTests(unittest.TestCase):
             "He could not help but smile. The path was quiet. He sucked in a cold air.",
             "polish",
             "auto",
-            learned=False,
         )
         jobs = span_jobs_for(0, program)
         packed = pack_span_jobs(jobs, max_chars=40)
@@ -147,6 +145,15 @@ class StitchTests(unittest.TestCase):
         before = "The mountain wind was cold."
         after = "Then he walked on."
         echoed = f"{before} He smiled. {after}"
+        self.assertEqual(trim_echo(echoed, source, before, after), "He smiled.")
+
+    def test_trim_echo_handles_clipped_context_markers(self) -> None:
+        # clip_context prepends/appends an ellipsis on the clipped side; the
+        # model echoes the real text without it.
+        source = "He could not help but smile."
+        before = "…wind was cold."
+        after = "Then he walked on…"
+        echoed = "wind was cold. He smiled. Then he walked on"
         self.assertEqual(trim_echo(echoed, source, before, after), "He smiled.")
 
     def test_trim_echo_rejects_whole_passage_echo(self) -> None:

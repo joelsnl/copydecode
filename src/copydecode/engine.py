@@ -1,3 +1,5 @@
+"""HTTP client for local LLM servers (llama.cpp, vLLM, Ollama, OpenAI-compatible)."""
+
 from __future__ import annotations
 
 import json
@@ -7,7 +9,13 @@ from dataclasses import dataclass
 
 import httpx
 
-from copydecode.hardware import DeviceProfile, estimate_params_b, is_reasoning_model, recommended_serve_commands
+from copydecode.errors import CopydecodeError
+from copydecode.hardware import (
+    DeviceProfile,
+    estimate_params_b,
+    is_reasoning_model,
+    recommended_serve_commands,
+)
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 THINKING_RE = re.compile(r"<thinking>.*?</thinking>", re.DOTALL | re.IGNORECASE)
@@ -20,11 +28,8 @@ PROBE_CANDIDATES = (
 )
 
 
-class EngineError(RuntimeError):
-    pass
-
-
-OllamaError = EngineError
+class EngineError(CopydecodeError):
+    """An LLM server could not be found, started, or spoken to."""
 
 
 def strip_model_noise(text: str) -> str:
@@ -36,7 +41,7 @@ def strip_model_noise(text: str) -> str:
 
 @dataclass
 class EngineInfo:
-    kind: str
+    kind: str  # ollama | llamacpp | vllm | openai
     host: str
     label: str
 
@@ -49,38 +54,33 @@ def _ok(url: str, timeout: float = 1.2) -> httpx.Response | None:
 
 
 def classify_host(host: str) -> EngineInfo:
+    """Identify which server kind answers at ``host``.
+
+    Probe order matters: vLLM also serves ``/health``, so ``/health`` alone
+    cannot distinguish vLLM from llama.cpp. ``/api/tags`` is Ollama-only and
+    ``/props`` is llama.cpp-only; anything else that speaks ``/v1/models`` is
+    treated as an OpenAI-compatible server (vLLM when it says so).
+    """
     base = host.rstrip("/")
     tags = _ok(base + "/api/tags")
     if tags is not None and tags.status_code == 200:
         return EngineInfo("ollama", base, "Ollama")
-    health = _ok(base + "/health")
-    if health is not None and health.status_code == 200:
+    props = _ok(base + "/props")
+    if props is not None and props.status_code == 200:
         return EngineInfo("llamacpp", base, "llama.cpp")
     models = _ok(base + "/v1/models")
     if models is not None and models.status_code == 200:
-        body = models.text.lower()
-        kind = "vllm" if "vllm" in body or "model_name" in body else "openai"
-        label = "vLLM" if kind == "vllm" else "OpenAI-compatible"
-        return EngineInfo(kind, base, label)
-    completion = _ok(base + "/completion")
-    if completion is not None and completion.status_code in {200, 400, 405}:
-        return EngineInfo("llamacpp", base, "llama.cpp")
+        kind = "vllm" if "vllm" in models.text.lower() else "openai"
+        return EngineInfo(kind, base, "vLLM" if kind == "vllm" else "OpenAI-compatible")
     raise EngineError(
         f"No LLM server at {base}. Start Ollama (`ollama serve`), llama-server, or vLLM."
     )
 
 
 def discover_engine(preferred: str | None, host: str | None, profile: DeviceProfile) -> EngineInfo:
+    """Find a running server, honoring an explicit host or a preferred kind."""
     if host:
-        info = classify_host(host)
-        if preferred and preferred not in {"auto", info.kind}:
-            if preferred == "openai" and info.kind in {"vllm", "openai", "llamacpp"}:
-                return info
-            if preferred == "llamacpp" and info.kind == "llamacpp":
-                return info
-            if preferred == "ollama" and info.kind == "ollama":
-                return info
-        return info
+        return classify_host(host)
 
     found: list[EngineInfo] = []
     for candidate in PROBE_CANDIDATES:
@@ -99,9 +99,7 @@ def discover_engine(preferred: str | None, host: str | None, profile: DeviceProf
 
     if preferred and preferred != "auto":
         for info in found:
-            if preferred == "openai" and info.kind in {"vllm", "openai"}:
-                return info
-            if info.kind == preferred or (preferred == "llamacpp" and info.kind == "llamacpp"):
+            if info.kind == preferred or (preferred == "openai" and info.kind in {"vllm", "openai"}):
                 return info
         raise EngineError(
             f"No {preferred} server found on ports 8000, 8080, or 11434. "
@@ -112,7 +110,7 @@ def discover_engine(preferred: str | None, host: str | None, profile: DeviceProf
     if profile.backend != "cuda":
         order = ["llamacpp", "ollama", "openai", "vllm"]
     rank = {kind: i for i, kind in enumerate(order)}
-    found.sort(key=lambda info: rank.get(info.kind, 9))
+    found.sort(key=lambda info: rank.get(info.kind, len(order)))
     return found[0]
 
 
@@ -133,27 +131,34 @@ def list_models(info: EngineInfo) -> list[str]:
 
 
 def pick_model(names: list[str], max_params_b: float) -> str | None:
+    """Largest non-reasoning model that fits the hardware cap.
+
+    Models whose size cannot be inferred from their name are never auto-picked
+    while a sized, fitting model exists.
+    """
     fitting: list[tuple[float, str]] = []
     others: list[str] = []
+    reasoning: list[str] = []
     for name in names:
         if is_reasoning_model(name):
-            others.append(name)
+            reasoning.append(name)
             continue
         params = estimate_params_b(name)
-        if params <= max_params_b + 0.2:
+        if params is not None and params <= max_params_b + 0.2:
             fitting.append((params, name))
         else:
             others.append(name)
-    fitting.sort(reverse=True)
     if fitting:
+        fitting.sort(reverse=True)
         return fitting[0][1]
-    non_reason = [name for name in others if not is_reasoning_model(name)]
-    if non_reason:
-        return non_reason[0]
-    return names[0] if names else None
+    if others:
+        return others[0]
+    return reasoning[0] if reasoning else None
 
 
 class LLMEngine:
+    """Streaming text generation against one classified server."""
+
     def __init__(
         self,
         info: EngineInfo,
@@ -176,8 +181,14 @@ class LLMEngine:
     def close(self) -> None:
         self._client.close()
 
+    def __enter__(self) -> LLMEngine:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
     def can_prefill(self) -> bool:
-        """llama.cpp can copy the stable prefix with n_predict=0. vLLM APC is automatic."""
+        """llama.cpp can copy a stable prefix with n_predict=0. vLLM APC is automatic."""
         return self.info.kind == "llamacpp"
 
     def prefill(self, text: str) -> bool:
@@ -196,6 +207,27 @@ class LLMEngine:
             return response.status_code < 400
         except httpx.HTTPError:
             return False
+
+    def count_prompt_tokens(self, text: str) -> int | None:
+        """Token count of ``text`` under the server's own tokenizer, or None.
+
+        Only llama.cpp exposes ``/tokenize``. Use this for values the server
+        interprets in its own token space (``n_keep``); client-side estimates
+        do not line up with the server's tokenization.
+        """
+        if not text or self.info.kind != "llamacpp":
+            return None
+        try:
+            response = self._client.post(self.info.host + "/tokenize", json={"content": text})
+        except httpx.HTTPError:
+            return None
+        if response.status_code >= 400:
+            return None
+        try:
+            tokens = response.json().get("tokens")
+        except ValueError:
+            return None
+        return len(tokens) if isinstance(tokens, list) else None
 
     def generate(
         self,
@@ -230,9 +262,6 @@ class LLMEngine:
             stop=stop,
             speculate=speculate,
         )
-
-    def complete(self, system: str, user: str, on_token: Callable[[str], None] | None = None) -> str:
-        return self.generate(user, system=system, max_tokens=min(2048, self.num_ctx // 2), on_token=on_token)
 
     def _ollama(
         self,
@@ -285,6 +314,8 @@ class LLMEngine:
             "prompt": prompt,
             "n_predict": max_tokens,
             "temperature": self.temperature,
+            # Repetition penalty breaks n-gram draft acceptance, so it is
+            # disabled whenever speculative extras are requested.
             "repeat_penalty": 1.0 if speculate else 1.08,
             "cache_prompt": True,
             "stream": True,
@@ -299,16 +330,17 @@ class LLMEngine:
         try:
             return self._stream_llamacpp(url, payload, on_token)
         except EngineError as exc:
-            msg = str(exc)
-            if speculate and "HTTP 400" in msg:
+            message = str(exc)
+            if speculate and "HTTP 400" in message:
                 payload.pop("speculative.n_max", None)
                 payload.pop("speculative.n_min", None)
                 try:
                     return self._stream_llamacpp(url, payload, on_token)
                 except EngineError as inner:
-                    msg = str(inner)
-            if "HTTP 404" not in msg:
+                    message = str(inner)
+            if "HTTP 404" not in message:
                 raise
+            # Builds without /completion still speak the OpenAI route.
             return self._openai(
                 user,
                 system=system,
@@ -340,28 +372,29 @@ class LLMEngine:
         }
         if stop:
             payload["stop"] = stop
-        if speculate and self.info.kind == "vllm":
-            payload["repetition_penalty"] = 1.0
-            payload["min_tokens"] = 0
         url = self.info.host + "/v1/chat/completions"
+        candidates = [payload]
+        if speculate and self.info.kind == "vllm":
+            # Try vLLM's n-gram-friendly sampling first; retry plain on a 400
+            # from servers that reject the extra fields.
+            candidates.insert(0, {**payload, "repetition_penalty": 1.0, "min_tokens": 0})
+        last_error: EngineError | None = None
+        for i, candidate in enumerate(candidates):
+            try:
+                return self._stream_openai(url, candidate, on_token)
+            except EngineError as exc:
+                if i + 1 < len(candidates) and "HTTP 400" in str(exc):
+                    last_error = exc
+                    continue
+                raise
+        raise last_error if last_error else EngineError(f"LLM request to {url} failed.")
+
+    def _stream_openai(self, url: str, payload: dict, on_token: Callable[[str], None] | None) -> str:
         chunks: list[str] = []
         try:
             with self._client.stream("POST", url, json=payload) as response:
                 if response.status_code >= 400:
                     body = response.read().decode("utf-8", errors="replace")
-                    if speculate and response.status_code == 400 and (
-                        "repetition_penalty" in payload or "min_tokens" in payload
-                    ):
-                        payload.pop("repetition_penalty", None)
-                        payload.pop("min_tokens", None)
-                        return self._openai(
-                            user,
-                            system=system,
-                            max_tokens=max_tokens,
-                            on_token=on_token,
-                            stop=stop,
-                            speculate=False,
-                        )
                     raise EngineError(f"LLM HTTP {response.status_code} from {url}: {body[:400]}")
                 for line in response.iter_lines():
                     if not line:
@@ -376,9 +409,8 @@ class LLMEngine:
                         continue
                     if err := data.get("error"):
                         raise EngineError(str(err))
-                    delta = ((data.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
-                    if not delta:
-                        delta = ((data.get("choices") or [{}])[0].get("text") or "")
+                    choice = (data.get("choices") or [{}])[0]
+                    delta = (choice.get("delta") or {}).get("content") or choice.get("text") or ""
                     if delta:
                         chunks.append(delta)
                         if on_token:
@@ -453,23 +485,3 @@ class LLMEngine:
         except httpx.ReadTimeout as exc:
             raise EngineError(f"llama.cpp timed out after {self.timeout:.0f}s.") from exc
         return strip_model_noise("".join(chunks))
-
-
-class OllamaClient(LLMEngine):
-    """Backward-compatible wrapper used by older call sites."""
-
-    def __init__(
-        self,
-        host: str = "http://127.0.0.1:11434",
-        model: str = "qwen2.5:3b",
-        temperature: float = 0.25,
-        num_ctx: int = 8192,
-        timeout: float = 600.0,
-    ) -> None:
-        super().__init__(
-            EngineInfo("ollama", host.rstrip("/"), "Ollama"),
-            model=model,
-            temperature=temperature,
-            num_ctx=num_ctx,
-            timeout=timeout,
-        )

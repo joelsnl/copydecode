@@ -28,7 +28,7 @@ def _tokenizer_from_file(path: str):
 @lru_cache(maxsize=1)
 def _hf_tokenizer():
     """Load Qwen2.5 tokenizer.json from env, cache, or a one-time Hub fetch."""
-    raw = env_value("COPYDECODE_TOKENIZER", "NOVELPOLISHER_TOKENIZER")
+    raw = env_value("COPYDECODE_TOKENIZER")
     if raw.lower() in {"0", "off", "none", "estimate"}:
         return None
     try:

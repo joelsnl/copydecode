@@ -9,17 +9,20 @@ from unittest.mock import MagicMock, patch
 from copydecode.engine import EngineError
 from copydecode.hardware import DeviceProfile
 from copydecode.serve import (
+    ServerLog,
     binary_preferences,
     build_server_args,
     cudart_asset_for,
+    download_file,
     find_ollama_blob,
     gguf_choice,
     ollama_blob_from_manifest,
     parse_ollama_from,
     pick_release_asset,
+    release_assets,
     start_llama_server,
+    stop_server,
     wait_healthy,
-    ServerLog,
 )
 
 
@@ -153,7 +156,6 @@ class ServerArgTests(unittest.TestCase):
             Path("m.gguf"),
             _profile(),
             alias="qwen2.5:14b",
-            help_text="--alias --cache-prompt --flash-attn --cont-batching --spec-type",
         )
         self.assertIn("--n-gpu-layers", args)
         self.assertEqual(args[args.index("--n-gpu-layers") + 1], "99")
@@ -168,10 +170,17 @@ class ServerArgTests(unittest.TestCase):
             Path("m.gguf"),
             _profile(backend="cpu", vendor="none", max_params_b=3.0),
             alias="qwen2.5:3b",
-            help_text="--cache-prompt",
         )
         self.assertEqual(args[args.index("--n-gpu-layers") + 1], "0")
         self.assertNotIn("--flash-attn", args)
+
+    def test_minimal_args_drop_every_optional_flag(self) -> None:
+        full = build_server_args(Path("llama-server"), Path("m.gguf"), _profile(), alias="q")
+        minimal = build_server_args(Path("llama-server"), Path("m.gguf"), _profile(), alias="q", minimal=True)
+        for flag in ("--alias", "--cache-prompt", "--cont-batching", "--flash-attn", "--spec-type"):
+            self.assertIn(flag, full)
+            self.assertNotIn(flag, minimal)
+        self.assertEqual(minimal, full[: len(minimal)])
 
 
 class WaitAndStartTests(unittest.TestCase):
@@ -213,6 +222,87 @@ class WaitAndStartTests(unittest.TestCase):
             start_llama_server(_profile(), download=False)
         self.assertIn("11434", str(ctx.exception))
         self.assertIn("ollama.exe", str(ctx.exception))
+
+
+class StopServerTests(unittest.TestCase):
+    def test_refuses_to_kill_a_reused_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "llama-server.pid"
+            pid_file.write_text("4242", encoding="utf-8")
+            notes: list[str] = []
+            with (
+                patch("copydecode.serve.pid_path", return_value=pid_file),
+                patch("copydecode.serve._pid_name", return_value="chrome.exe"),
+                patch("copydecode.serve.subprocess.run") as run,
+                patch("copydecode.serve.os.kill") as kill,
+            ):
+                self.assertFalse(stop_server(log=notes.append))
+                run.assert_not_called()
+                kill.assert_not_called()
+            self.assertFalse(pid_file.exists())
+            self.assertTrue(any("chrome.exe" in note for note in notes))
+
+    def test_kills_verified_llama_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "llama-server.pid"
+            pid_file.write_text("4242", encoding="utf-8")
+            with (
+                patch("copydecode.serve.pid_path", return_value=pid_file),
+                patch("copydecode.serve._pid_name", return_value="llama-server.exe"),
+                patch("copydecode.serve.platform.system", return_value="Windows"),
+                patch("copydecode.serve.subprocess.run") as run,
+            ):
+                self.assertTrue(stop_server())
+                run.assert_called_once()
+            self.assertFalse(pid_file.exists())
+
+
+class DownloadTests(unittest.TestCase):
+    def _fake_stream(self, payload: bytes):
+        def fake(url, tmp, offset, digest, label, log) -> None:
+            tmp.write_bytes(payload)
+            digest.update(payload)
+
+        return fake
+
+    def test_checksum_match_finalizes_file(self) -> None:
+        import hashlib
+
+        payload = b"llama"
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "asset.zip"
+            with patch("copydecode.serve._stream_download", side_effect=self._fake_stream(payload)):
+                download_file(
+                    "https://example.invalid/a.zip",
+                    dest,
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                )
+            self.assertEqual(dest.read_bytes(), payload)
+
+    def test_checksum_mismatch_deletes_partial_and_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "asset.zip"
+            with patch("copydecode.serve._stream_download", side_effect=self._fake_stream(b"llama")):
+                with self.assertRaises(EngineError) as ctx:
+                    download_file("https://example.invalid/a.zip", dest, expected_sha256="0" * 64)
+            self.assertIn("Checksum mismatch", str(ctx.exception))
+            self.assertFalse(dest.exists())
+            self.assertFalse(dest.with_suffix(dest.suffix + ".partial").exists())
+
+    def test_release_assets_extract_github_digest(self) -> None:
+        release = {
+            "assets": [
+                {
+                    "name": "llama-b1-bin-win-cpu-x64.zip",
+                    "browser_download_url": "https://example.invalid/b1.zip",
+                    "digest": "sha256:" + "a" * 64,
+                },
+                {"name": "no-digest.zip", "browser_download_url": "https://example.invalid/n.zip"},
+            ]
+        }
+        assets = release_assets(release)
+        self.assertEqual(assets["llama-b1-bin-win-cpu-x64.zip"], ("https://example.invalid/b1.zip", "a" * 64))
+        self.assertEqual(assets["no-digest.zip"], ("https://example.invalid/n.zip", ""))
 
 
 if __name__ == "__main__":

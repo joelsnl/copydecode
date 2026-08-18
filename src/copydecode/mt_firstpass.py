@@ -1,5 +1,8 @@
+"""Optional NLLB draft pass (CTranslate2). Loaded only when COPYDECODE_NLLB_PATH is set."""
+
 from __future__ import annotations
 
+import gc
 from functools import lru_cache
 
 from copydecode.detect import foreign_script_ratio, guess_nllb_src_lang
@@ -8,7 +11,7 @@ from copydecode.paths import env_value
 
 @lru_cache(maxsize=1)
 def _load_translator():
-    path = env_value("COPYDECODE_NLLB_PATH", "NOVELPOLISHER_NLLB_PATH")
+    path = env_value("COPYDECODE_NLLB_PATH")
     if not path:
         return None
     try:
@@ -17,7 +20,7 @@ def _load_translator():
     except ImportError:
         return None
     # Default CPU: the polish 14B is already resident on the GPU via vLLM/llama.cpp.
-    device = env_value("COPYDECODE_NLLB_DEVICE", "NOVELPOLISHER_NLLB_DEVICE", default="cpu").lower() or "cpu"
+    device = env_value("COPYDECODE_NLLB_DEVICE", default="cpu").lower()
     if device not in {"cpu", "cuda"}:
         device = "cpu"
     translator = ctranslate2.Translator(path, device=device, compute_type="int8")
@@ -26,14 +29,9 @@ def _load_translator():
 
 
 def unload_nllb() -> None:
-    """Drop the NLLB translator so a 14B polish model can own the GPU."""
+    """Drop the NLLB translator so the polish model can own the GPU."""
     _load_translator.cache_clear()
-    try:
-        import gc
-
-        gc.collect()
-    except Exception:
-        pass
+    gc.collect()
 
 
 def nllb_available() -> bool:

@@ -1,21 +1,23 @@
+"""End-to-end job: load a document, plan the work, rewrite, write the output."""
+
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
-from copydecode.checkpoint import Checkpoint, file_fingerprint
 from copydecode.changelog import ChangeLog
+from copydecode.checkpoint import Checkpoint, file_fingerprint
 from copydecode.chunking import format_numbered, pack_segments
 from copydecode.detect import detect_mode, sample_text
-from copydecode.document import Chapter
-from copydecode.engine import LLMEngine
+from copydecode.document import Chapter, Segment
+from copydecode.engine import EngineError, LLMEngine
+from copydecode.errors import CopydecodeError, DocumentError
 from copydecode.glossary import Glossary, glossary_from_data, load_glossary_file
 from copydecode.hardware import DeviceProfile
 from copydecode.io import load_document, write_document
@@ -78,20 +80,7 @@ class JobConfig:
     checkpoint: bool = False
     token_pack: bool = True
     speculate: bool = True
-    learned_tagger: bool = True
-    update_tagger: bool = True
     output_format: str = ""
-
-
-def default_chunk_size(model: str, fallback: int = 900) -> int:
-    name = model.lower()
-    if any(tag in name for tag in (":32b", "32b", ":27b", ":22b", ":20b")):
-        return min(fallback, 2800) if fallback else 2800
-    if any(tag in name for tag in (":14b", ":13b", ":12b", ":9b")):
-        return 1800 if not fallback else min(fallback, 2200)
-    if any(tag in name for tag in (":8b", ":7b")):
-        return 1400 if not fallback else min(fallback, 1600)
-    return fallback or 900
 
 
 def selectable_chapters(chapters: list[Chapter]) -> list[Chapter]:
@@ -108,7 +97,7 @@ def length_ok(source: str, output: str, mode: str) -> bool:
 
 
 def max_tokens_for(
-    segments,
+    segments: list[Segment],
     mode: str,
     num_ctx: int,
     count_tokens: Callable[[str], int] | None = None,
@@ -171,13 +160,20 @@ def extract_glossary(client: LLMEngine, chapters: list[Chapter]) -> Glossary:
     return glossary_from_data({"terms": terms})
 
 
-def build_glossary(config: JobConfig, chapters: list[Chapter], client: LLMEngine | None) -> Glossary:
+def build_glossary(
+    config: JobConfig,
+    chapters: list[Chapter],
+    client: LLMEngine | None,
+    *,
+    extract: bool | None = None,
+) -> Glossary:
     glossary = Glossary()
     if config.glossary_path and config.glossary_path.exists():
         glossary.merge(load_glossary_file(config.glossary_path), overwrite=True)
-    if config.extract_glossary:
+    do_extract = config.extract_glossary if extract is None else extract
+    if do_extract:
         if client is None:
-            raise RuntimeError("An LLM server is required for glossary extraction.")
+            raise EngineError("An LLM server is required for glossary extraction.")
         console.print("[cyan]Extracting glossary from the document…[/cyan]")
         extracted = extract_glossary(client, chapters)
         glossary.merge(extracted, overwrite=False)
@@ -188,10 +184,25 @@ def build_glossary(config: JobConfig, chapters: list[Chapter], client: LLMEngine
     return glossary
 
 
+def _gate_chunk_outputs(
+    segments: list[Segment], parsed: list[str], mode: str
+) -> tuple[list[str], int]:
+    """Keep each output only when it passes the length gate; count survivors."""
+    gated: list[str] = []
+    accepted = 0
+    for seg, out in zip(segments, parsed, strict=True):
+        if length_ok(seg.text, out, mode):
+            gated.append(out)
+            accepted += 1
+        else:
+            gated.append(seg.text)
+    return gated, accepted
+
+
 def rewrite_chunk(
     client: LLMEngine,
     mode: str,
-    segments,
+    segments: list[Segment],
     glossary: Glossary,
     previous: str,
     style: str,
@@ -209,8 +220,8 @@ def rewrite_chunk(
         extra_style=style,
         mode=mode,
     )
-    last = ""
     max_tokens = max_tokens_for(segments, mode, num_ctx, count_tokens=count_tokens)
+    last = ""
     for attempt in range(retries + 1):
         prompt = user
         if attempt:
@@ -222,62 +233,50 @@ def rewrite_chunk(
         parsed = parse_numbered(last, len(segments))
         if not parsed:
             continue
-        gated = [
-            out if length_ok(src.text, out, mode) else src.text
-            for src, out in zip(segments, parsed)
-        ]
-        if any(not length_ok(src.text, out, mode) for src, out in zip(segments, parsed)):
-            if all(g == src.text for g, src in zip(gated, segments)):
-                continue
-        return gated
+        gated, accepted = _gate_chunk_outputs(segments, parsed, mode)
+        if accepted:
+            return gated
     parsed = parse_numbered(last, len(segments))
     if parsed:
-        return [
-            out if length_ok(src.text, out, mode) else src.text
-            for src, out in zip(segments, parsed)
-        ]
+        gated, _accepted = _gate_chunk_outputs(segments, parsed, mode)
+        return gated
     console.print("[yellow]Could not parse model output; keeping the original passage.[/yellow]")
     return [seg.text for seg in segments]
 
 
 def _gate_span_outputs(jobs: list[SpanJob], parsed: list[str]) -> tuple[list[str], int]:
     gated: list[str] = []
-    good = 0
-    for job, raw in zip(jobs, parsed):
+    accepted = 0
+    for job, raw in zip(jobs, parsed, strict=True):
         out = trim_echo(raw, job.text, job.before, job.after)
         if replacement_ok(job.text, out):
             gated.append(out)
-            good += 1
+            accepted += 1
         else:
             gated.append(job.text)
-    return gated, good
+    return gated, accepted
 
 
 def rewrite_span_jobs(
     client: LLMEngine,
     jobs: list[SpanJob],
-    glossary: Glossary,
-    previous: str,
-    style: str,
-    retries: int,
-    num_ctx: int,
     *,
     glossary_block: str = "",
+    style: str = "",
+    retries: int = 2,
+    num_ctx: int = 4096,
     count_tokens: Callable[[str], int] | None = None,
     speculate: bool = True,
     n_keep: int = 0,
 ) -> list[str]:
-    del previous
-    if not glossary_block:
-        numbered = " ".join(job.text for job in jobs)
-        glossary_block = glossary.as_prompt(numbered) if glossary.unapplied_hits(numbered) else ""
+    """Rewrite a pack of REPLACE spans; failed packs split in half and retry."""
     system = span_system_prompt(glossary_block, style)
     user = build_span_user_prompt(jobs)
-    last = ""
     max_tokens = max_tokens_for_spans(jobs, num_ctx, count_tokens=count_tokens)
     stop = ["KEEP before", "KEEP after"]
     if len(jobs) == 1:
         stop.extend(["\n[1]", "\n[2]"])
+    last = ""
     for attempt in range(retries + 1):
         prompt = user
         if attempt:
@@ -293,44 +292,33 @@ def rewrite_span_jobs(
         parsed = parse_numbered(last, len(jobs))
         if not parsed:
             continue
-        gated, good = _gate_span_outputs(jobs, parsed)
-        if good:
+        gated, accepted = _gate_span_outputs(jobs, parsed)
+        if accepted:
             return gated
     parsed = parse_numbered(last, len(jobs))
     if parsed:
-        gated, good = _gate_span_outputs(jobs, parsed)
-        if good:
+        gated, accepted = _gate_span_outputs(jobs, parsed)
+        if accepted:
             return gated
     if len(jobs) > 1:
         mid = max(1, len(jobs) // 2)
-        console.print(
-            f"[dim]REPLACE pack of {len(jobs)} failed checks; splitting.[/dim]"
-        )
-        return rewrite_span_jobs(
-            client,
-            jobs[:mid],
-            glossary,
-            "",
-            style,
-            retries,
-            num_ctx,
-            glossary_block=glossary_block,
-            count_tokens=count_tokens,
-            speculate=speculate,
-            n_keep=n_keep,
-        ) + rewrite_span_jobs(
-            client,
-            jobs[mid:],
-            glossary,
-            "",
-            style,
-            retries,
-            num_ctx,
-            glossary_block=glossary_block,
-            count_tokens=count_tokens,
-            speculate=speculate,
-            n_keep=n_keep,
-        )
+        console.print(f"[dim]REPLACE pack of {len(jobs)} failed checks; splitting.[/dim]")
+        halves = (jobs[:mid], jobs[mid:])
+        return [
+            text
+            for half in halves
+            for text in rewrite_span_jobs(
+                client,
+                half,
+                glossary_block=glossary_block,
+                style=style,
+                retries=retries,
+                num_ctx=num_ctx,
+                count_tokens=count_tokens,
+                speculate=speculate,
+                n_keep=n_keep,
+            )
+        ]
     return [job.text for job in jobs]
 
 
@@ -369,8 +357,6 @@ def programs_for_chapter(
     mode: str,
     skip_mode: str,
     glossary: Glossary,
-    *,
-    learned: bool | None = None,
 ) -> dict[int, EditProgram]:
     programs: dict[int, EditProgram] = {}
     for seg in chapter.segments:
@@ -383,7 +369,6 @@ def programs_for_chapter(
             glossary,
             seg.tag,
             force_dirty=True,
-            learned=learned,
         )
     return programs
 
@@ -393,6 +378,66 @@ def jobs_from_programs(programs: dict[int, EditProgram]) -> list[SpanJob]:
     for index in sorted(programs):
         jobs.extend(span_jobs_for(index, programs[index]))
     return jobs
+
+
+@dataclass
+class ChapterPlan:
+    """Everything the LLM pass needs for one chapter, computed exactly once."""
+
+    chapter: Chapter
+    dirty: list[Segment]
+    programs: dict[int, EditProgram] = field(default_factory=dict)
+    span_packs: list[list[SpanJob]] = field(default_factory=list)
+    segment_packs: list[list[Segment]] = field(default_factory=list)
+
+    @property
+    def llm_packs(self) -> int:
+        return len(self.span_packs) + len(self.segment_packs)
+
+    @property
+    def skipped(self) -> int:
+        return len(self.chapter.segments) - len(self.dirty)
+
+
+def plan_chapter(
+    chapter: Chapter,
+    mode: str,
+    skip_mode: str,
+    glossary: Glossary,
+    *,
+    copydecode: bool,
+    packing: dict,
+) -> ChapterPlan:
+    dirty = [seg for seg in chapter.segments if needs_llm(seg, mode, skip_mode, glossary)]
+    programs: dict[int, EditProgram] = {}
+    span_packs: list[list[SpanJob]] = []
+    segment_packs: list[list[Segment]] = []
+    if dirty and copydecode and mode == "polish":
+        programs = programs_for_chapter(chapter, mode, skip_mode, glossary)
+        jobs = jobs_from_programs(programs)
+        if jobs:
+            span_packs = pack_span_jobs(
+                jobs,
+                packing["max_chars"],
+                max_prompt_tokens=packing["max_prompt_tokens"],
+                prefix_tokens=packing["prefix_tokens"],
+                count_tokens=packing["count_tokens"],
+            )
+    elif dirty:
+        segment_packs = pack_segments(
+            dirty,
+            packing["max_chars"],
+            max_prompt_tokens=packing["max_prompt_tokens"],
+            prefix_tokens=packing["prefix_tokens"],
+            count_tokens=packing["count_tokens"],
+        )
+    return ChapterPlan(
+        chapter=chapter,
+        dirty=dirty,
+        programs=programs,
+        span_packs=span_packs,
+        segment_packs=segment_packs,
+    )
 
 
 def prepare_chapter_text(
@@ -415,29 +460,19 @@ def prepare_chapter_text(
 
 
 def print_plan(
-    chapters: list[Chapter],
+    plans: list[ChapterPlan],
     mode: str,
     model: str,
-    max_chars: int,
     skip_mode: str,
-    glossary: Glossary,
+    packing: dict,
     profile: DeviceProfile | None = None,
     engine_label: str = "",
     copydecode: bool = False,
-    packing: dict | None = None,
-    learned: bool | None = None,
-    glossary_label: str = "",
 ) -> tuple[int, int]:
-    packing = packing or {
-        "max_chars": max_chars,
-        "max_prompt_tokens": 0,
-        "prefix_tokens": 0,
-        "count_tokens": None,
-    }
     pack_label = (
         f"{packing['max_prompt_tokens']} tok/pack"
         if packing.get("count_tokens")
-        else f"{max_chars} chars/chunk"
+        else f"{packing['max_chars']} chars/chunk"
     )
     table = Table(title=f"{mode} · {model} · {pack_label}")
     table.add_column("#", justify="right")
@@ -446,52 +481,23 @@ def print_plan(
     table.add_column("Paras", justify="right")
     table.add_column("LLM", justify="right")
     table.add_column("Skip", justify="right")
-    work = selectable_chapters(chapters)
     llm_total = 0
     skip_total = 0
     keep_chars = 0
     replace_chars = 0
-    for i, ch in enumerate(work, start=1):
-        dirty = [seg for seg in ch.segments if needs_llm(seg, mode, skip_mode, glossary)]
-        skipped = len(ch.segments) - len(dirty)
-        if copydecode and mode == "polish":
-            programs = programs_for_chapter(ch, mode, skip_mode, glossary, learned=learned)
-            jobs = jobs_from_programs(programs)
-            packs = (
-                pack_span_jobs(
-                    jobs,
-                    packing["max_chars"],
-                    max_prompt_tokens=packing["max_prompt_tokens"],
-                    prefix_tokens=packing["prefix_tokens"],
-                    count_tokens=packing["count_tokens"],
-                )
-                if jobs
-                else []
-            )
-            for prog in programs.values():
-                keep_chars += prog.keep_chars
-                replace_chars += prog.replace_chars
-        else:
-            packs = (
-                pack_segments(
-                    dirty,
-                    packing["max_chars"],
-                    max_prompt_tokens=packing["max_prompt_tokens"],
-                    prefix_tokens=packing["prefix_tokens"],
-                    count_tokens=packing["count_tokens"],
-                )
-                if dirty
-                else []
-            )
-        llm_total += len(packs)
-        skip_total += skipped
+    for i, plan in enumerate(plans, start=1):
+        llm_total += plan.llm_packs
+        skip_total += plan.skipped
+        for program in plan.programs.values():
+            keep_chars += program.keep_chars
+            replace_chars += program.replace_chars
         table.add_row(
             str(i),
-            ch.href,
-            ch.title[:42],
-            str(len(ch.segments)),
-            str(len(packs)),
-            str(skipped),
+            plan.chapter.href,
+            plan.chapter.title[:42],
+            str(len(plan.chapter.segments)),
+            str(plan.llm_packs),
+            str(plan.skipped),
         )
     console.print(table)
     if profile:
@@ -500,17 +506,7 @@ def print_plan(
             f"ctx {profile.num_ctx} · workers {profile.workers} · skip {skip_mode}"
             + (f" · {engine_label}" if engine_label else "")
             + (" · KEEP/REPLACE stitch" if copydecode and mode == "polish" else "")
-            + (
-                f" · {tokenizer_label()}"
-                if packing.get("count_tokens")
-                else ""
-            )
-            + (
-                " · learned tagger"
-                if copydecode and mode == "polish" and learned
-                else (" · heuristic tagger" if copydecode and mode == "polish" else "")
-            )
-            + (f" · {glossary_label}" if glossary_label else "")
+            + (f" · {tokenizer_label()}" if packing.get("count_tokens") else "")
             + "[/dim]"
         )
     extras = f"LLM chunks: {llm_total}  ·  paragraphs skipped: {skip_total}"
@@ -523,144 +519,69 @@ def print_plan(
 
 
 def process_chapter(
-    chapter: Chapter,
+    plan: ChapterPlan,
     *,
     client: LLMEngine,
     mode: str,
     glossary: Glossary,
-    max_chars: int,
-    skip_mode: str,
     style: str,
     retries: int,
     num_ctx: int,
     ckpt: Checkpoint,
-    copydecode: bool = False,
     changes: ChangeLog | None = None,
-    packing: dict | None = None,
+    count_tokens: Callable[[str], int] | None = None,
     glossary_block: str = "",
     speculate: bool = True,
-    learned: bool | None = None,
+    n_keep: int = 0,
 ) -> tuple[int, int]:
-    packing = packing or {
-        "max_chars": max_chars,
-        "max_prompt_tokens": 0,
-        "prefix_tokens": 0,
-        "count_tokens": None,
-    }
-    dirty = [seg for seg in chapter.segments if needs_llm(seg, mode, skip_mode, glossary)]
-    skipped = len(chapter.segments) - len(dirty)
-    if not dirty:
-        return 0, skipped
-    if copydecode and mode == "polish":
-        return _process_chapter_copydecode(
-            chapter,
-            dirty=dirty,
-            skipped=skipped,
+    """Rewrite one planned chapter in place. Returns (packs sent, paragraphs skipped)."""
+    if plan.span_packs:
+        return _process_span_packs(
+            plan,
             client=client,
-            mode=mode,
-            glossary=glossary,
-            max_chars=max_chars,
-            skip_mode=skip_mode,
             style=style,
             retries=retries,
             num_ctx=num_ctx,
             ckpt=ckpt,
             changes=changes,
-            packing=packing,
+            count_tokens=count_tokens,
             glossary_block=glossary_block,
             speculate=speculate,
-            learned=learned,
+            n_keep=n_keep,
         )
-    packs = pack_segments(
-        dirty,
-        packing["max_chars"],
-        max_prompt_tokens=packing["max_prompt_tokens"],
-        prefix_tokens=packing["prefix_tokens"],
-        count_tokens=packing["count_tokens"],
-    )
-    assembled: dict[int, list[str]] = {seg.index: [] for seg in dirty}
-    originals = {seg.index: seg.text for seg in dirty}
-    previous = ""
-    for pack_i, pack in enumerate(packs):
-        first = pack[0].index
-        last = pack[-1].index
-        chunk_id = f"{chapter.item_id}:p{pack_i}:{first}-{last}:{len(pack)}"
-        if ckpt.done(chunk_id):
-            texts = ckpt.get(chunk_id)
-        else:
-            texts = rewrite_chunk(
-                client,
-                mode,
-                pack,
-                glossary,
-                previous,
-                style,
-                retries,
-                num_ctx,
-                count_tokens=packing["count_tokens"],
-            )
-            ckpt.save_chunk(chunk_id, texts)
-        for seg, text in zip(pack, texts):
-            assembled[seg.index].append(text)
-        previous = texts[-1][-500:]
-    by_index = {seg.index: seg for seg in chapter.segments}
-    for index, parts in assembled.items():
-        if parts and index in by_index:
-            new_text = "\n".join(parts)
-            if changes:
-                changes.record(
-                    chapter_id=chapter.item_id,
-                    chapter_title=chapter.title,
-                    href=chapter.href,
-                    para=index,
-                    before=originals.get(index, ""),
-                    after=new_text,
-                    kind="paragraph",
-                )
-            by_index[index].text = new_text
-    return len(packs), skipped
+    if plan.segment_packs:
+        return _process_segment_packs(
+            plan,
+            client=client,
+            mode=mode,
+            glossary=glossary,
+            style=style,
+            retries=retries,
+            num_ctx=num_ctx,
+            ckpt=ckpt,
+            changes=changes,
+            count_tokens=count_tokens,
+        )
+    return 0, len(plan.chapter.segments)
 
 
-def _process_chapter_copydecode(
-    chapter: Chapter,
+def _process_span_packs(
+    plan: ChapterPlan,
     *,
-    dirty: list,
-    skipped: int,
     client: LLMEngine,
-    mode: str,
-    glossary: Glossary,
-    max_chars: int,
-    skip_mode: str,
     style: str,
     retries: int,
     num_ctx: int,
     ckpt: Checkpoint,
-    changes: ChangeLog | None = None,
-    packing: dict | None = None,
-    glossary_block: str = "",
-    speculate: bool = True,
-    learned: bool | None = None,
+    changes: ChangeLog | None,
+    count_tokens: Callable[[str], int] | None,
+    glossary_block: str,
+    speculate: bool,
+    n_keep: int,
 ) -> tuple[int, int]:
-    packing = packing or {
-        "max_chars": max_chars,
-        "max_prompt_tokens": 0,
-        "prefix_tokens": 0,
-        "count_tokens": None,
-    }
-    programs = programs_for_chapter(chapter, mode, skip_mode, glossary, learned=learned)
-    jobs = jobs_from_programs(programs)
-    if not jobs:
-        return 0, skipped + len(dirty)
-    packs = pack_span_jobs(
-        jobs,
-        packing["max_chars"],
-        max_prompt_tokens=packing["max_prompt_tokens"],
-        prefix_tokens=packing["prefix_tokens"],
-        count_tokens=packing["count_tokens"],
-    )
+    chapter = plan.chapter
     replacements: dict[tuple[int, int], str] = {}
-    n_keep = packing.get("prefix_tokens") or 0
-    for pack_i, pack in enumerate(packs):
+    for pack_i, pack in enumerate(plan.span_packs):
         first = pack[0]
         last = pack[-1]
         chunk_id = (
@@ -673,18 +594,18 @@ def _process_chapter_copydecode(
             texts = rewrite_span_jobs(
                 client,
                 pack,
-                glossary,
-                "",
-                style,
-                retries,
-                num_ctx,
                 glossary_block=glossary_block,
-                count_tokens=packing["count_tokens"],
+                style=style,
+                retries=retries,
+                num_ctx=num_ctx,
+                count_tokens=count_tokens,
                 speculate=speculate,
                 n_keep=n_keep,
             )
             ckpt.save_chunk(chunk_id, texts)
-        for job, text in zip(pack, texts):
+        # strict: a length mismatch here means corrupt resume state, which
+        # must fail loudly instead of silently dropping spans.
+        for job, text in zip(pack, texts, strict=True):
             replacements[(job.seg_index, job.span_index)] = text
             if changes:
                 changes.record(
@@ -697,24 +618,83 @@ def _process_chapter_copydecode(
                     kind="span",
                 )
     by_index = {seg.index: seg for seg in chapter.segments}
-    for seg_index, program in programs.items():
-        if seg_index not in by_index:
+    for seg_index, program in plan.programs.items():
+        seg = by_index.get(seg_index)
+        if seg is None:
             continue
         span_replacements = {
             span_i: text
             for (s_i, span_i), text in replacements.items()
             if s_i == seg_index
         }
-        by_index[seg_index].text = program.stitched(span_replacements)
-    return len(packs), skipped
+        seg.text = program.stitched(span_replacements)
+    return len(plan.span_packs), plan.skipped
 
 
-def run_job(config: JobConfig, client: LLMEngine, profile: DeviceProfile) -> Path:
+def _process_segment_packs(
+    plan: ChapterPlan,
+    *,
+    client: LLMEngine,
+    mode: str,
+    glossary: Glossary,
+    style: str,
+    retries: int,
+    num_ctx: int,
+    ckpt: Checkpoint,
+    changes: ChangeLog | None,
+    count_tokens: Callable[[str], int] | None,
+) -> tuple[int, int]:
+    chapter = plan.chapter
+    assembled: dict[int, list[str]] = {seg.index: [] for seg in plan.dirty}
+    originals = {seg.index: seg.text for seg in plan.dirty}
+    previous = ""
+    for pack_i, pack in enumerate(plan.segment_packs):
+        chunk_id = f"{chapter.item_id}:p{pack_i}:{pack[0].index}-{pack[-1].index}:{len(pack)}"
+        if ckpt.done(chunk_id):
+            texts = ckpt.get(chunk_id)
+        else:
+            texts = rewrite_chunk(
+                client,
+                mode,
+                pack,
+                glossary,
+                previous,
+                style,
+                retries,
+                num_ctx,
+                count_tokens=count_tokens,
+            )
+            ckpt.save_chunk(chunk_id, texts)
+        for seg, text in zip(pack, texts, strict=True):
+            assembled[seg.index].append(text)
+        previous = texts[-1][-500:]
+    by_index = {seg.index: seg for seg in chapter.segments}
+    for index, parts in assembled.items():
+        if not parts or index not in by_index:
+            continue
+        new_text = "\n".join(parts)
+        if changes:
+            changes.record(
+                chapter_id=chapter.item_id,
+                chapter_title=chapter.title,
+                href=chapter.href,
+                para=index,
+                before=originals.get(index, ""),
+                after=new_text,
+                kind="paragraph",
+            )
+        by_index[index].text = new_text
+    return len(plan.segment_packs), plan.skipped
+
+
+def run_job(config: JobConfig, client: LLMEngine | None, profile: DeviceProfile) -> Path:
+    """Run one document job. ``client`` may be None only for a dry run."""
+    if client is None and not config.dry_run:
+        raise CopydecodeError("An LLM engine is required unless dry_run is set.")
     doc = load_document(config.input_path)
-    chapters = doc.chapters
-    work = selectable_chapters(chapters)
+    work = selectable_chapters(doc.chapters)
     if not work:
-        raise RuntimeError("No readable text was found in this file.")
+        raise DocumentError("No readable text was found in this file.")
 
     sample = sample_text(seg.text for ch in work for seg in ch.segments)
     mode = config.mode if config.mode != "auto" else detect_mode(sample)
@@ -725,17 +705,35 @@ def run_job(config: JobConfig, client: LLMEngine, profile: DeviceProfile) -> Pat
     start = max(config.from_chapter, 1)
     end = config.to_chapter or len(work)
     chosen = work[start - 1 : end]
+    if not chosen:
+        raise CopydecodeError(
+            f"The chapter range {start}–{end or len(work)} selects no sections; "
+            f"this file has {len(work)}."
+        )
 
     style = job_style(config.style)
-    glossary = build_glossary(config, chapters, client)
-    use_nllb = bool(config.nllb_firstpass and mode == "translate" and nllb_available())
-    if config.nllb_firstpass and mode == "translate" and not nllb_available():
+    if config.extract_glossary and config.dry_run:
+        console.print("[dim]Glossary extraction is skipped during a dry run.[/dim]")
+    glossary = build_glossary(
+        config,
+        doc.chapters,
+        client,
+        extract=config.extract_glossary and not config.dry_run,
+    )
+
+    use_nllb = bool(
+        config.nllb_firstpass
+        and mode == "translate"
+        and not config.dry_run
+        and nllb_available()
+    )
+    if config.nllb_firstpass and mode == "translate" and not config.dry_run and not use_nllb:
         console.print(
             "[dim]NLLB first pass off (set COPYDECODE_NLLB_PATH to a CTranslate2 model).[/dim]"
         )
 
     changes: ChangeLog | None = None
-    if config.changelog and not config.dry_run:
+    if config.changelog and not config.dry_run and client is not None:
         changes = ChangeLog(
             input_name=config.input_path.name,
             output_name=config.output_path.name,
@@ -743,18 +741,18 @@ def run_job(config: JobConfig, client: LLMEngine, profile: DeviceProfile) -> Pat
             model=config.model,
             engine=client.info.label,
         )
-    chosen_ids = {ch.item_id for ch in chosen}
-    for chapter in work:
-        prepare_chapter_text(
-            chapter,
-            glossary,
-            config.apply_glossary,
-            mode,
-            use_nllb,
-            changes=changes if chapter.item_id in chosen_ids else None,
-        )
+
+    # Only chapters inside the requested range are prepared and rewritten;
+    # everything else is copied through byte-identical (EPUB) or verbatim.
+    for chapter in chosen:
+        prepare_chapter_text(chapter, glossary, config.apply_glossary, mode, use_nllb, changes=changes)
     if use_nllb:
         unload_nllb()
+    if len(chosen) < len(work) and not config.dry_run:
+        console.print(
+            f"[dim]{len(work) - len(chosen)} section(s) outside the chapter range "
+            "are copied through unchanged.[/dim]"
+        )
 
     copydecode = bool(config.copydecode and mode == "polish")
     glossary_block = glossary.as_stable_prompt() if copydecode else ""
@@ -767,90 +765,50 @@ def run_job(config: JobConfig, client: LLMEngine, profile: DeviceProfile) -> Pat
         copydecode=copydecode,
         mode=mode,
     )
-    engine_label = f"{client.info.label} @ {client.info.host}"
-    if copydecode and client.info.kind in {"vllm", "llamacpp"}:
-        engine_label += " · prefix cache"
-        if config.speculate:
-            engine_label += " · ngram REPLACE"
-    if copydecode and client.can_prefill():
-        engine_label += " · parallel prefill"
-    learned_on = bool(config.learned_tagger)
-    if learned_on:
-        from copydecode.tagger import get_tagger, tagger_id
 
-        learned_on = get_tagger() is not None
-        tagger_fp = tagger_id() if learned_on else "heur"
-    else:
-        tagger_fp = "off"
+    engine_label = ""
+    if client is not None:
+        engine_label = f"{client.info.label} @ {client.info.host}"
+        if copydecode and client.info.kind in {"vllm", "llamacpp"}:
+            engine_label += " · prefix cache"
+            if config.speculate:
+                engine_label += " · ngram REPLACE"
+        if copydecode and client.can_prefill():
+            engine_label += " · parallel prefill"
+
+    plans = [
+        plan_chapter(chapter, mode, skip_mode, glossary, copydecode=copydecode, packing=packing)
+        for chapter in work
+    ]
+    chosen_ids = {ch.item_id for ch in chosen}
+    chosen_plans = [plan for plan in plans if plan.chapter.item_id in chosen_ids]
 
     print_plan(
-        chapters,
+        plans,
         mode,
         config.model,
-        max_chars,
         skip_mode,
-        glossary,
+        packing,
         profile,
         engine_label,
         copydecode=copydecode,
-        packing=packing,
-        learned=learned_on,
-        glossary_label="keep source register",
     )
-    chosen_llm = 0
-    empty_chapters = 0
-    for chapter in chosen:
-        dirty = [seg for seg in chapter.segments if needs_llm(seg, mode, skip_mode, glossary)]
-        if not dirty:
-            empty_chapters += 1
-            continue
-        if copydecode:
-            jobs = jobs_from_programs(
-                programs_for_chapter(
-                    chapter,
-                    mode,
-                    skip_mode,
-                    glossary,
-                    learned=config.learned_tagger,
-                )
-            )
-            packs = (
-                pack_span_jobs(
-                    jobs,
-                    packing["max_chars"],
-                    max_prompt_tokens=packing["max_prompt_tokens"],
-                    prefix_tokens=packing["prefix_tokens"],
-                    count_tokens=packing["count_tokens"],
-                )
-                if jobs
-                else []
-            )
-        else:
-            packs = pack_segments(
-                dirty,
-                packing["max_chars"],
-                max_prompt_tokens=packing["max_prompt_tokens"],
-                prefix_tokens=packing["prefix_tokens"],
-                count_tokens=packing["count_tokens"],
-            )
-        if packs:
-            chosen_llm += len(packs)
-        else:
-            empty_chapters += 1
     if config.dry_run:
         return config.output_path
+    assert client is not None
 
     state_path = None
     if config.checkpoint:
         state_dir = config.state_dir or (
-            config.input_path.parent / ".polisher" / config.input_path.stem
+            config.input_path.parent / ".copydecode" / config.input_path.stem
         )
-        state_path = state_dir / "checkpoint.json"
+        state_path = state_dir / "checkpoint.jsonl"
         if config.clean and state_path.exists():
             state_path.unlink()
 
     fingerprint = "|".join(
         [
+            "v3",
             file_fingerprint(config.input_path),
             config.model,
             mode,
@@ -863,8 +821,6 @@ def run_job(config: JobConfig, client: LLMEngine, profile: DeviceProfile) -> Pat
             "cd1" if copydecode else "cd0",
             "tok1" if config.token_pack else "tok0",
             "sp1" if (copydecode and config.speculate) else "sp0",
-            "gate2",
-            f"tg:{tagger_fp}",
         ]
     )
     ckpt = Checkpoint(
@@ -872,9 +828,16 @@ def run_job(config: JobConfig, client: LLMEngine, profile: DeviceProfile) -> Pat
         {"fingerprint": fingerprint, "mode": mode, "model": config.model, "engine": client.info.kind},
     )
 
-    progress_total = max(chosen_llm + empty_chapters, 1)
-    if copydecode and client.can_prefill() and (workers <= 1 or len(chosen) == 1):
-        client.prefill(span_prefix_text(glossary_block, style))
+    progress_total = max(sum(max(plan.llm_packs, 1) for plan in chosen_plans), 1)
+    n_keep = 0
+    if copydecode and client.can_prefill():
+        prefix = span_prefix_text(glossary_block, style)
+        if workers <= 1 or len(chosen_plans) == 1:
+            client.prefill(prefix)
+        # n_keep must be counted by the server's own tokenizer; a client-side
+        # estimate would pin the wrong prefix boundary on context shift.
+        n_keep = client.count_prompt_tokens(prefix) or 0
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -885,44 +848,41 @@ def run_job(config: JobConfig, client: LLMEngine, profile: DeviceProfile) -> Pat
     ) as progress:
         task = progress.add_task("Rewriting", total=progress_total)
 
-        def run_one(chapter: Chapter) -> tuple[Chapter, int]:
+        def run_one(plan: ChapterPlan) -> tuple[ChapterPlan, int]:
             packs, _skipped = process_chapter(
-                chapter,
+                plan,
                 client=client,
                 mode=mode,
                 glossary=glossary,
-                max_chars=max_chars,
-                skip_mode=skip_mode,
                 style=style,
                 retries=config.retries,
                 num_ctx=num_ctx,
                 ckpt=ckpt,
-                copydecode=copydecode,
                 changes=changes,
-                packing=packing,
+                count_tokens=packing["count_tokens"],
                 glossary_block=glossary_block,
                 speculate=bool(config.speculate and copydecode),
-                learned=config.learned_tagger,
+                n_keep=n_keep,
             )
-            return chapter, packs if packs else 1
+            return plan, packs if packs else 1
 
-        if workers <= 1 or len(chosen) == 1:
-            for chapter in chosen:
-                progress.update(task, description=chapter.title[:40])
-                _ch, stepped = run_one(chapter)
+        if workers <= 1 or len(chosen_plans) == 1:
+            for plan in chosen_plans:
+                progress.update(task, description=plan.chapter.title[:40])
+                _plan, stepped = run_one(plan)
                 progress.advance(task, stepped)
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(run_one, chapter): chapter for chapter in chosen}
+                futures = {pool.submit(run_one, plan): plan for plan in chosen_plans}
                 for fut in as_completed(futures):
-                    chapter, stepped = fut.result()
-                    progress.update(task, description=chapter.title[:40])
+                    plan, stepped = fut.result()
+                    progress.update(task, description=plan.chapter.title[:40])
                     progress.advance(task, stepped)
 
     write_document(
         doc,
         config.output_path,
-        rewrite_ids={ch.item_id for ch in chosen},
+        rewrite_ids=chosen_ids,
         fmt=config.output_format or None,
     )
     console.print(f"[green]Wrote[/green] {config.output_path}")
@@ -934,19 +894,6 @@ def run_job(config: JobConfig, client: LLMEngine, profile: DeviceProfile) -> Pat
             f"[green]Change log[/green] {md_path}  ·  {len(changes.edits)} rewrite(s), "
             f"{changes.identical} unchanged"
         )
-        if config.update_tagger and config.learned_tagger and (changes.edits or changes.unchanged):
-            try:
-                from copydecode.tagger import leaky_model_text, train_from_files
-
-                tagger, _dest = train_from_files([json_path], merge_existing=True)
-                leaky = sum(1 for edit in changes.edits if leaky_model_text(edit.after))
-                console.print(
-                    f"[dim]Tagger updated for the next document · {len(tagger.anchors)} gold REPLACE anchors"
-                    + (f" · {leaky} leaky outputs" if leaky else "")
-                    + "[/dim]"
-                )
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                console.print(f"[yellow]Tagger update skipped:[/yellow] {exc}")
     if state_path is not None:
         console.print(f"Resume state: {state_path}")
     return config.output_path

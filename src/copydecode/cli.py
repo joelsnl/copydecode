@@ -1,3 +1,5 @@
+"""Command-line interface."""
+
 from __future__ import annotations
 
 import argparse
@@ -10,17 +12,29 @@ from rich.table import Table
 
 from copydecode import __version__
 from copydecode.document import default_output_path, detect_format, normalize_format
-from copydecode.engine import EngineError, EngineInfo, LLMEngine, discover_engine, list_models, pick_model
-from copydecode.hardware import clamp_for_model, detect_device, estimate_params_b, is_reasoning_model, recommended_serve_commands
-from copydecode.io import load_document
+from copydecode.engine import (
+    EngineError,
+    EngineInfo,
+    LLMEngine,
+    discover_engine,
+    list_models,
+    pick_model,
+)
+from copydecode.errors import CopydecodeError
+from copydecode.hardware import (
+    DeviceProfile,
+    clamp_for_model,
+    detect_device,
+    estimate_params_b,
+    is_reasoning_model,
+    recommended_serve_commands,
+)
 from copydecode.pipeline import JobConfig, build_glossary, run_job
-from copydecode.serve import plan_serve, start_llama_server, stop_server
+from copydecode.serve import gguf_choice, plan_serve, start_llama_server, stop_server
 
 console = Console()
 
-
-def default_output(input_path: Path, mode: str, fmt: str | None = None) -> Path:
-    return default_output_path(input_path, mode, fmt)
+COMMANDS = ("run", "glossary", "models", "devices", "serve")
 
 
 def add_common_llm_args(parser: argparse.ArgumentParser) -> None:
@@ -67,10 +81,19 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--style", default="", help="Extra style instructions")
     run.add_argument("--max-chars", type=int, default=0, help="Chunk size. 0 = hardware default")
     run.add_argument("--retries", type=int, default=2)
-    run.add_argument("--from-chapter", type=int, default=1, help="First section (EPUB chapter / PDF page with text / Markdown H1), 1-based")
+    run.add_argument(
+        "--from-chapter",
+        type=int,
+        default=1,
+        help="First section (EPUB chapter / PDF page with text / Markdown H1), 1-based",
+    )
     run.add_argument("--to-chapter", type=int, default=0, help="Last section. 0 = last")
     run.add_argument("--state-dir", type=Path)
-    run.add_argument("--dry-run", action="store_true")
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the plan and exit. Never downloads, starts servers, or calls the LLM.",
+    )
     run.add_argument("--clean", action="store_true")
     run.add_argument("--workers", type=int, default=0, help="Chapter workers. 0 = hardware default")
     run.add_argument(
@@ -95,9 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--checkpoint",
         action="store_true",
-        help="Write .polisher/checkpoint.json so a long CLI run can resume",
+        help="Write .copydecode/checkpoint.jsonl so a long run can resume",
     )
-    run.add_argument("--no-changelog", action="store_true", help=argparse.SUPPRESS)
     run.add_argument(
         "--no-token-pack",
         action="store_true",
@@ -107,16 +129,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-speculate",
         action="store_true",
         help="Disable ngram / prompt-lookup extras on REPLACE completions",
-    )
-    run.add_argument(
-        "--no-learned-tagger",
-        action="store_true",
-        help="Use the heuristic KEEP/REPLACE tagger instead of the trained CPU model",
-    )
-    run.add_argument(
-        "--no-update-tagger",
-        action="store_true",
-        help="Do not fold this run's change log into the KEEP/REPLACE tagger",
     )
     run.add_argument("--allow-reasoning", action="store_true", help="Allow DeepSeek-R1/QwQ anyway")
     run.add_argument(
@@ -149,42 +161,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--stop", action="store_true", help="Stop a detached llama-server started by this tool")
     serve.add_argument("--no-download", action="store_true", help="Only use files already on disk")
     serve.add_argument("--dry-run", action="store_true", help="Print the detected OS/GPU and planned files")
-
-    train = sub.add_parser(
-        "train-tagger",
-        help="Train the KEEP/REPLACE CPU tagger from .changes.json logs (Seq2Edits-lite)",
-    )
-    train.add_argument("logs", nargs="*", type=Path, help=".changes.json files from previous polish runs")
-    train.add_argument("-o", "--output", type=Path, help="Where to write span_tagger.json")
-    train.add_argument("--min-recall", type=float, default=0.99, help="Keep gold REPLACE recall at least this high")
-    train.add_argument("--no-synthetic", action="store_true", help="Do not mix in the built-in MTL/clean seeds")
-    train.add_argument(
-        "--fresh",
-        action="store_true",
-        help="Do not keep gold REPLACE anchors from the existing cached tagger",
-    )
-    train.add_argument(
-        "--install",
-        action="store_true",
-        help="Also copy the model next to the package data so every run picks it up",
-    )
-
-    evallog = sub.add_parser(
-        "eval-log",
-        help="Score a .changes.json: REPLACE recall vs KEEP rate, heuristic vs learned tagger",
-    )
-    evallog.add_argument("log", type=Path, help=".changes.json")
-
-    exportkd = sub.add_parser(
-        "export-kd",
-        help="Write aligned source/target JSONL for a later 7B student (does not train Unsloth)",
-    )
-    exportkd.add_argument("log", type=Path, help=".changes.json")
-    exportkd.add_argument("-o", "--output", type=Path, help="JSONL path")
     return parser
 
 
-def connect(args: argparse.Namespace, *, auto_serve: bool = False):
+def connect(args: argparse.Namespace, *, auto_serve: bool = False) -> tuple[DeviceProfile, EngineInfo]:
     profile = detect_device()
     preferred = getattr(args, "engine", "auto")
     host = getattr(args, "host", None)
@@ -205,7 +185,7 @@ def connect(args: argparse.Namespace, *, auto_serve: bool = False):
         return profile, info
 
 
-def resolve_model(info: EngineInfo, profile, requested: str | None, allow_reasoning: bool) -> str:
+def resolve_model(info: EngineInfo, profile: DeviceProfile, requested: str | None, allow_reasoning: bool) -> str:
     names = list_models(info)
     if requested:
         if requested not in names and f"{requested}:latest" not in names:
@@ -224,7 +204,7 @@ def resolve_model(info: EngineInfo, profile, requested: str | None, allow_reason
     return chosen
 
 
-def print_profile(profile, info: EngineInfo | None = None) -> None:
+def print_profile(profile: DeviceProfile, info: EngineInfo | None = None) -> None:
     table = Table(title="This machine")
     table.add_column("Field")
     table.add_column("Value")
@@ -254,55 +234,20 @@ def print_profile(profile, info: EngineInfo | None = None) -> None:
             console.print(f"[dim]{label}: {cmd}[/dim]")
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    if not args.input.exists():
-        console.print(f"[red]File not found:[/red] {args.input}")
-        return 1
+def _connect_for_dry_run(args: argparse.Namespace) -> tuple[DeviceProfile, EngineInfo | None]:
+    """Use a running server when there is one, but never install or start anything."""
+    profile = detect_device()
     try:
-        detect_format(args.input)
-    except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
-        return 1
-    out_fmt = None
-    if args.output_format:
-        try:
-            out_fmt = normalize_format(args.output_format)
-        except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
-            return 1
-    profile, info = connect(args, auto_serve=True)
-    model = resolve_model(info, profile, args.model, args.allow_reasoning)
-    profile = clamp_for_model(profile, model)
-    if args.workers:
-        profile.workers = max(1, args.workers)
-    if args.num_ctx:
-        if profile.backend == "cuda" and profile.vram_mb < 16000 and args.num_ctx > profile.num_ctx:
-            console.print(
-                f"[yellow]--num-ctx {args.num_ctx} is above the {profile.num_ctx} "
-                "hardware cap. KV cache will squeeze VRAM; leaving your override.[/yellow]"
-            )
-        profile.num_ctx = args.num_ctx
-    if args.max_chars:
-        profile.max_chars = args.max_chars
-    if args.skip_mode != "auto":
-        profile.skip_mode = args.skip_mode
-    print_profile(profile, info)
-    client = LLMEngine(
-        info,
-        model=model,
-        temperature=args.temperature,
-        num_ctx=profile.num_ctx,
-        timeout=args.timeout,
-    )
-    output = args.output or default_output(
-        args.input,
-        "translate" if args.mode == "translate" else "polish",
-        out_fmt,
-    )
-    config = JobConfig(
+        return profile, discover_engine(args.engine, args.host, profile)
+    except EngineError:
+        return profile, None
+
+
+def _job_config(args: argparse.Namespace, output: Path, info: EngineInfo | None, model: str, out_fmt: str | None) -> JobConfig:
+    return JobConfig(
         input_path=args.input,
         output_path=output,
-        host=info.host,
+        host=info.host if info else "",
         model=model,
         mode=args.mode,
         glossary_path=args.glossary,
@@ -325,18 +270,67 @@ def cmd_run(args: argparse.Namespace) -> int:
         nllb_firstpass=not args.no_nllb,
         allow_reasoning=args.allow_reasoning,
         copydecode=not args.no_copydecode,
-        changelog=bool(args.changelog) and not args.no_changelog,
+        changelog=bool(args.changelog),
         checkpoint=bool(args.checkpoint),
         token_pack=not args.no_token_pack,
         speculate=not args.no_speculate,
-        learned_tagger=not args.no_learned_tagger,
-        update_tagger=not args.no_update_tagger,
         output_format=out_fmt or "",
     )
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    if not args.input.exists():
+        console.print(f"[red]File not found:[/red] {args.input}")
+        return 1
+    detect_format(args.input)
+    out_fmt = normalize_format(args.output_format) if args.output_format else None
+
+    if args.dry_run:
+        profile, info = _connect_for_dry_run(args)
+    else:
+        profile, info = connect(args, auto_serve=True)
+
+    if info is not None:
+        model = resolve_model(info, profile, args.model, args.allow_reasoning)
+    else:
+        model = args.model or gguf_choice(profile)[0]
+        console.print(f"[dim]No LLM server is running; planning with {model}.[/dim]")
+    profile = clamp_for_model(profile, model)
+    if args.workers:
+        profile.workers = max(1, args.workers)
+    if args.num_ctx:
+        if profile.backend == "cuda" and profile.vram_mb < 16000 and args.num_ctx > profile.num_ctx:
+            console.print(
+                f"[yellow]--num-ctx {args.num_ctx} is above the {profile.num_ctx} "
+                "hardware cap. KV cache will squeeze VRAM; leaving your override.[/yellow]"
+            )
+        profile.num_ctx = args.num_ctx
+    if args.max_chars:
+        profile.max_chars = args.max_chars
+    if args.skip_mode != "auto":
+        profile.skip_mode = args.skip_mode
+    print_profile(profile, info)
+
+    client: LLMEngine | None = None
+    if info is not None:
+        client = LLMEngine(
+            info,
+            model=model,
+            temperature=args.temperature,
+            num_ctx=profile.num_ctx,
+            timeout=args.timeout,
+        )
+    output = args.output or default_output_path(
+        args.input,
+        "translate" if args.mode == "translate" else "polish",
+        out_fmt,
+    )
+    config = _job_config(args, output, info, model, out_fmt)
     try:
         run_job(config, client, profile)
     finally:
-        client.close()
+        if client is not None:
+            client.close()
     return 0
 
 
@@ -344,10 +338,11 @@ def cmd_glossary(args: argparse.Namespace) -> int:
     if not args.input.exists():
         console.print(f"[red]File not found:[/red] {args.input}")
         return 1
+    from copydecode.io import load_document
+
     profile, info = connect(args, auto_serve=True)
     model = resolve_model(info, profile, args.model, allow_reasoning=False)
     profile = clamp_for_model(profile, model)
-    client = LLMEngine(info, model=model, temperature=args.temperature, num_ctx=profile.num_ctx, timeout=args.timeout)
     doc = load_document(args.input)
     config = JobConfig(
         input_path=args.input,
@@ -361,10 +356,10 @@ def cmd_glossary(args: argparse.Namespace) -> int:
         num_ctx=profile.num_ctx,
         timeout=args.timeout,
     )
-    try:
+    with LLMEngine(
+        info, model=model, temperature=args.temperature, num_ctx=profile.num_ctx, timeout=args.timeout
+    ) as client:
         build_glossary(config, doc.chapters, client)
-    finally:
-        client.close()
     return 0
 
 
@@ -376,13 +371,19 @@ def cmd_models(args: argparse.Namespace) -> int:
         return 1
     table = Table(title=f"Models on {info.label}")
     table.add_column("Name")
+    table.add_column("Size")
     table.add_column("Fits")
     table.add_column("Default")
     chosen = pick_model(names, profile.max_params_b)
     for name in names:
         params = estimate_params_b(name)
-        fits = "yes" if params <= profile.max_params_b + 0.2 and not is_reasoning_model(name) else "no"
-        table.add_row(name, fits, "yes" if name == chosen else "")
+        fits = (
+            "yes"
+            if params is not None and params <= profile.max_params_b + 0.2 and not is_reasoning_model(name)
+            else "no"
+        )
+        size = f"{params:g}B" if params is not None else "?"
+        table.add_row(name, size, fits, "yes" if name == chosen else "")
     console.print(table)
     print_profile(profile, info)
     return 0
@@ -423,75 +424,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return 0
 
 
-def cmd_train_tagger(args: argparse.Namespace) -> int:
-    from copydecode.paths import package_data_dir
-    from copydecode.tagger import bundled_tagger_path, save_tagger, train_from_files
-
-    logs = [path for path in args.logs if path.is_file()]
-    missing = [path for path in args.logs if not path.is_file()]
-    for path in missing:
-        console.print(f"[yellow]Skip missing log:[/yellow] {path}")
-    tagger, dest = train_from_files(
-        logs,
-        dest=args.output,
-        min_recall=args.min_recall,
-        include_synthetic=not args.no_synthetic,
-        merge_existing=not args.fresh,
-    )
-    console.print(f"Wrote tagger {dest}")
-    table = Table(title="KEEP/REPLACE tagger")
-    table.add_column("Field")
-    table.add_column("Value")
-    table.add_row("REPLACE examples", str(tagger.n_replace))
-    table.add_row("KEEP examples", str(tagger.n_keep))
-    table.add_row("REPLACE recall", f"{tagger.replace_recall:.3f}")
-    table.add_row("KEEP rate (train)", f"{tagger.keep_rate:.3f}")
-    table.add_row("KEEP precision", f"{tagger.keep_precision:.3f}")
-    table.add_row("Gold REPLACE anchors", str(len(tagger.anchors)))
-    table.add_row("threshold", f"{tagger.threshold:.3f}")
-    table.add_row("fingerprint", tagger.fingerprint)
-    console.print(table)
-    if args.install:
-        bundled = bundled_tagger_path()
-        save_tagger(tagger, bundled)
-        console.print(f"Installed {bundled} (package data {package_data_dir()})")
-    return 0
-
-
-def cmd_eval_log(args: argparse.Namespace) -> int:
-    from copydecode.tagger import evaluate_against_changelog, get_tagger
-
-    if not args.log.is_file():
-        console.print(f"[red]File not found:[/red] {args.log}")
-        return 1
-    stats = evaluate_against_changelog(args.log, get_tagger())
-    table = Table(title=args.log.name)
-    table.add_column("Metric")
-    table.add_column("Value")
-    for key, value in stats.items():
-        if value is None:
-            value = "—"
-        elif isinstance(value, float):
-            value = f"{value:.3f}"
-        table.add_row(key, str(value))
-    console.print(table)
-    return 0
-
-
-def cmd_export_kd(args: argparse.Namespace) -> int:
-    from copydecode.tagger import export_kd_pairs
-
-    if not args.log.is_file():
-        console.print(f"[red]File not found:[/red] {args.log}")
-        return 1
-    pairs = export_kd_pairs(args.log)
-    dest = args.output or args.log.with_suffix(".kd.jsonl")
-    dest.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in pairs) + ("\n" if pairs else ""), encoding="utf-8")
-    console.print(f"Wrote {len(pairs)} aligned pairs to {dest}")
-    console.print("[dim]7B Unsloth/CLaSp distill is a separate GPU job; do not load it beside the 14B.[/dim]")
-    return 0
-
-
 def cmd_devices(args: argparse.Namespace) -> int:
     profile = detect_device()
     try:
@@ -507,32 +439,25 @@ def cmd_devices(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    commands = {"run", "glossary", "models", "devices", "serve", "train-tagger", "eval-log", "export-kd"}
-    if raw and raw[0] not in commands and not raw[0].startswith("-"):
-        raw = ["run"] + raw
+    top_level = {"-h", "--help", "--version"}
+    if raw and raw[0] not in COMMANDS and raw[0] not in top_level:
+        # `copydecode book.epub` and `copydecode -o out.txt book.epub` both
+        # mean `copydecode run …`.
+        raw = ["run", *raw]
     parser = build_parser()
     args = parser.parse_args(raw)
     if not args.command:
         parser.print_help()
         return 0
+    handlers = {
+        "run": cmd_run,
+        "glossary": cmd_glossary,
+        "models": cmd_models,
+        "devices": cmd_devices,
+        "serve": cmd_serve,
+    }
     try:
-        if args.command == "run":
-            return cmd_run(args)
-        if args.command == "glossary":
-            return cmd_glossary(args)
-        if args.command == "models":
-            return cmd_models(args)
-        if args.command == "devices":
-            return cmd_devices(args)
-        if args.command == "serve":
-            return cmd_serve(args)
-        if args.command == "train-tagger":
-            return cmd_train_tagger(args)
-        if args.command == "eval-log":
-            return cmd_eval_log(args)
-        if args.command == "export-kd":
-            return cmd_export_kd(args)
-    except (EngineError, RuntimeError, json.JSONDecodeError, ValueError, FileNotFoundError) as exc:
+        return handlers[args.command](args)
+    except (CopydecodeError, FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
         console.print(f"[red]{exc}[/red]")
         return 1
-    return 0

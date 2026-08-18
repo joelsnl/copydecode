@@ -1,4 +1,3 @@
-# Author: joelsnl
 """Format-agnostic chapter/paragraph model used by every reader and writer."""
 
 from __future__ import annotations

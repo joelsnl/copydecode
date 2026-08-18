@@ -12,7 +12,7 @@ from copydecode.prompts import (
     span_system_prompt,
 )
 from copydecode.qwen_tokens import estimate_qwen_tokens, prompt_token_budget
-from copydecode.spans import SpanJob, format_span_job, pack_span_jobs, tag_text, span_jobs_for
+from copydecode.spans import SpanJob, format_span_job, pack_span_jobs, span_jobs_for, tag_text
 
 
 class QwenTokenTests(unittest.TestCase):
@@ -74,7 +74,6 @@ class TokenPackTests(unittest.TestCase):
             "He could not help but smile. The path was quiet. He sucked in a cold air.",
             "polish",
             "auto",
-            learned=False,
         )
         jobs = span_jobs_for(0, program)
         packed = pack_span_jobs(jobs, max_chars=40)

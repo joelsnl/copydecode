@@ -1,3 +1,5 @@
+"""Embedding API: KEEP/REPLACE polish for plain lists of paragraphs."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -28,9 +30,7 @@ def wants_polish(text: str, skip_mode: str = "auto") -> bool:
         return False
     if " " not in raw and len(raw) < 80:
         return False
-    if mtl_score(raw, "polish") >= skip_threshold(skip_mode):
-        return True
-    return False
+    return mtl_score(raw, "polish") >= skip_threshold(skip_mode)
 
 
 def connect_engine(
@@ -144,7 +144,6 @@ def polish_paragraphs(
             glossary,
             "p",
             force_dirty=True,
-            learned=True,
         )
         jobs = span_jobs_for(index, program)
         if jobs:
@@ -170,11 +169,14 @@ def polish_paragraphs(
             client.close()
         return results, client.model
 
+    n_keep = 0
     if client.can_prefill():
-        client.prefill(span_prefix_text("", style))
+        prefix = span_prefix_text("", style)
+        client.prefill(prefix)
+        # n_keep in the server's own token space; 0 leaves it unset.
+        n_keep = client.count_prompt_tokens(prefix) or 0
 
     done = 0
-    n_keep = packing.get("prefix_tokens") or 0
     try:
         for index, program, _jobs, packs in packed_jobs:
             if cancelled and cancelled():
@@ -186,17 +188,15 @@ def polish_paragraphs(
                 outs = rewrite_span_jobs(
                     client,
                     pack,
-                    glossary,
-                    "",
-                    style,
+                    glossary_block="",
+                    style=style,
                     retries=2,
                     num_ctx=profile.num_ctx,
-                    glossary_block="",
                     count_tokens=packing["count_tokens"],
                     speculate=True,
                     n_keep=n_keep,
                 )
-                for job, out in zip(pack, outs):
+                for job, out in zip(pack, outs, strict=True):
                     replacements[job.span_index] = out
                 done += 1
                 if progress:

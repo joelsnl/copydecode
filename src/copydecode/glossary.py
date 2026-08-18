@@ -1,3 +1,5 @@
+"""User-supplied terminology applied as deterministic string substitution."""
+
 from __future__ import annotations
 
 import json
@@ -20,6 +22,10 @@ class Term:
 @dataclass
 class Glossary:
     terms: list[Term] = field(default_factory=list)
+    # (pattern, matched-text -> Term); rebuilt lazily after mutation.
+    _index: tuple[re.Pattern[str], dict[str, Term]] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def add(self, term: Term, overwrite: bool = False) -> None:
         key = term.source.casefold()
@@ -29,10 +35,12 @@ class Glossary:
                     existing.target = term.target
                     existing.kind = term.kind or existing.kind
                     existing.notes = term.notes or existing.notes
+                    self._index = None
                 return
         self.terms.append(term)
+        self._index = None
 
-    def merge(self, other: "Glossary", overwrite: bool = False) -> None:
+    def merge(self, other: Glossary, overwrite: bool = False) -> None:
         for term in other.terms:
             self.add(term, overwrite=overwrite)
 
@@ -56,11 +64,7 @@ class Glossary:
         """Fixed glossary block for prefix-cache hits across every REPLACE pack."""
         seen: set[tuple[str, str]] = set()
         lines: list[str] = []
-        terms = [
-            term
-            for term in self.terms
-            if term.source and term.target and term.source != term.target
-        ]
+        terms = self._substitutions()
         terms.sort(key=lambda term: (-len(term.source), term.source.casefold()))
         for term in terms:
             key = (term.source.casefold(), term.target)
@@ -78,36 +82,70 @@ class Glossary:
     def unapplied_hits(self, text: str) -> list[Term]:
         return [term for term in self.relevant(text) if term.source != term.target]
 
-    def apply_to_text(self, text: str) -> str:
-        terms = [
+    def _substitutions(self) -> list[Term]:
+        return [
             term
             for term in self.terms
             if term.source and term.target and term.source != term.target
         ]
-        terms.sort(key=lambda term: len(term.source), reverse=True)
+
+    def _compiled(self) -> tuple[re.Pattern[str], dict[str, Term]] | None:
+        """One alternation over all sources, longest first.
+
+        A single pass means a term's *target* can never be re-matched by a
+        later term ({"Wang": "Wang Lin", "Lin": "Forest"} must not turn "Wang"
+        into "Wang Forest"). Replacement goes through a callable, so targets
+        are never interpreted as regex templates.
+        """
+        if self._index is not None:
+            return self._index
+        terms = sorted(self._substitutions(), key=lambda t: len(t.source), reverse=True)
+        if not terms:
+            return None
+        alternatives: list[str] = []
+        lookup: dict[str, Term] = {}
         for term in terms:
             if FOREIGN_SCRIPT_RE.search(term.source):
-                text = text.replace(term.source, term.target)
+                alternatives.append(re.escape(term.source))
             else:
-                pattern = re.compile(rf"\b{re.escape(term.source)}\b", re.IGNORECASE)
-                text = pattern.sub(term.target, text)
-        return text
+                alternatives.append(rf"\b{re.escape(term.source)}\b")
+            lookup.setdefault(term.source, term)
+            lookup.setdefault(term.source.casefold(), term)
+        pattern = re.compile("|".join(alternatives), re.IGNORECASE)
+        self._index = (pattern, lookup)
+        return self._index
+
+    def _term_for(self, matched: str) -> Term | None:
+        compiled = self._compiled()
+        if compiled is None:
+            return None
+        _pattern, lookup = compiled
+        return lookup.get(matched) or lookup.get(matched.casefold())
+
+    def apply_to_text(self, text: str) -> str:
+        compiled = self._compiled()
+        if compiled is None:
+            return text
+        pattern, _lookup = compiled
+
+        def substitute(match: re.Match[str]) -> str:
+            term = self._term_for(match.group(0))
+            return term.target if term else match.group(0)
+
+        return pattern.sub(substitute, text)
 
     def hit_counts(self, text: str) -> dict[str, int]:
+        compiled = self._compiled()
+        if compiled is None:
+            return {}
+        pattern, _lookup = compiled
         counts: dict[str, int] = {}
-        terms = [
-            term
-            for term in self.terms
-            if term.source and term.target and term.source != term.target
-        ]
-        terms.sort(key=lambda term: len(term.source), reverse=True)
-        for term in terms:
-            if FOREIGN_SCRIPT_RE.search(term.source):
-                n = text.count(term.source)
-            else:
-                n = len(re.findall(rf"\b{re.escape(term.source)}\b", text, re.IGNORECASE))
-            if n:
-                counts[f"{term.source} → {term.target}"] = n
+        for match in pattern.finditer(text):
+            term = self._term_for(match.group(0))
+            if term is None:
+                continue
+            key = f"{term.source} → {term.target}"
+            counts[key] = counts.get(key, 0) + 1
         return counts
 
     def to_dict(self) -> dict[str, Any]:

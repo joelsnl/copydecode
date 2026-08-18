@@ -289,7 +289,8 @@ def detect_device() -> DeviceProfile:
     )
 
 
-def estimate_params_b(model: str) -> float:
+def estimate_params_b(model: str) -> float | None:
+    """Parameter count in billions parsed from the model name, or None when unknown."""
     name = model.lower()
     match = re.search(r"(\d+(?:\.\d+)?)\s*b\b", name)
     if match:
@@ -298,7 +299,7 @@ def estimate_params_b(model: str) -> float:
         return 4.0
     if "e1b" in name:
         return 1.0
-    return 7.0
+    return None
 
 
 def is_reasoning_model(model: str) -> bool:
@@ -314,7 +315,13 @@ def clamp_for_model(profile: DeviceProfile, model: str) -> DeviceProfile:
     chars = profile.max_chars
     skip = profile.skip_mode
     gpu = profile.backend in {"cuda", "vulkan"}
-    if params > profile.max_params_b + 0.1:
+    if params is None:
+        notes.append(
+            f"Could not infer the size of {model} from its name; keeping one worker "
+            "and the hardware defaults."
+        )
+        workers = 1
+    elif params > profile.max_params_b + 0.1:
         notes.append(
             f"{model} is about {params:g}B; this machine is sized for {profile.max_params_b:g}B. "
             "Expect RAM offload. Forcing 1 worker, shorter context, aggressive skip."

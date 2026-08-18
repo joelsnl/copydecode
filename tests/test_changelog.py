@@ -8,7 +8,7 @@ from copydecode.changelog import ChangeLog, same_text
 from copydecode.checkpoint import Checkpoint
 from copydecode.epub_io import Chapter, Segment, parse_item_html
 from copydecode.glossary import Glossary
-from copydecode.pipeline import process_chapter
+from copydecode.pipeline import pack_kwargs, plan_chapter, process_chapter
 
 
 class FakeEngine:
@@ -92,22 +92,20 @@ class ChangeLogTests(unittest.TestCase):
         chapter = Chapter("c1", "chapter_0000.xhtml", "Ch 1", soup, segs)
         log = ChangeLog(mode="polish", model="fake")
         engine = FakeEngine()
+        packing = pack_kwargs(max_chars=1800, num_ctx=2048, token_pack=False)
+        plan = plan_chapter(chapter, "polish", "auto", Glossary(), copydecode=True, packing=packing)
         with tempfile.TemporaryDirectory() as tmp:
-            ckpt = Checkpoint(Path(tmp) / "checkpoint.json", {"fingerprint": "t", "mode": "polish"})
+            ckpt = Checkpoint(Path(tmp) / "checkpoint.jsonl", {"fingerprint": "t", "mode": "polish"})
             process_chapter(
-                chapter,
+                plan,
                 client=engine,  # type: ignore[arg-type]
                 mode="polish",
                 glossary=Glossary(),
-                max_chars=1800,
-                skip_mode="auto",
                 style="",
                 retries=0,
                 num_ctx=2048,
                 ckpt=ckpt,
-                copydecode=True,
                 changes=log,
-                learned=False,
             )
         self.assertGreaterEqual(log.sent, 1)
         self.assertTrue(any("could not help but" in edit.before for edit in log.edits))

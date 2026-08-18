@@ -1,3 +1,10 @@
+"""Resume state for long runs.
+
+Stored as JSON Lines: one header line with the run fingerprint, then one line
+per completed chunk. Saving a chunk appends a single line, so cost per chunk
+is constant instead of rewriting the whole file.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -13,10 +20,34 @@ class Checkpoint:
         self.meta = meta
         self.chunks: dict[str, list[str]] = {}
         self._lock = threading.Lock()
+        self._header_written = False
         if path is not None and path.exists():
-            saved = json.loads(path.read_text(encoding="utf-8"))
-            if saved.get("fingerprint") == meta.get("fingerprint"):
-                self.chunks = saved.get("chunks", {})
+            self._load(path)
+
+    def _load(self, path: Path) -> None:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if not lines:
+            return
+        try:
+            header = json.loads(lines[0])
+        except json.JSONDecodeError:
+            return
+        if header.get("fingerprint") != self.meta.get("fingerprint"):
+            return
+        chunks: dict[str, list[str]] = {}
+        for line in lines[1:]:
+            # A crash mid-append can truncate the final line; skip it and
+            # anything else that does not parse.
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            chunk_id = record.get("id")
+            texts = record.get("texts")
+            if isinstance(chunk_id, str) and isinstance(texts, list):
+                chunks[chunk_id] = [str(t) for t in texts]
+        self.chunks = chunks
+        self._header_written = True
 
     def done(self, chunk_id: str) -> bool:
         with self._lock:
@@ -31,15 +62,14 @@ class Checkpoint:
             self.chunks[chunk_id] = texts
             if self.path is None:
                 return
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "fingerprint": self.meta.get("fingerprint"),
-                "meta": self.meta,
-                "chunks": self.chunks,
-            }
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self.path)
+            if not self._header_written:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                header = {"fingerprint": self.meta.get("fingerprint"), "meta": self.meta}
+                self.path.write_text(json.dumps(header, ensure_ascii=False) + "\n", encoding="utf-8")
+                self._header_written = True
+            line = json.dumps({"id": chunk_id, "texts": texts}, ensure_ascii=False)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
 
 
 def file_fingerprint(path: Path) -> str:

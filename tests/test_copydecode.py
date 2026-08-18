@@ -8,7 +8,7 @@ from copydecode.checkpoint import Checkpoint
 from copydecode.engine import EngineInfo
 from copydecode.epub_io import Chapter, Segment, apply_segments, parse_item_html
 from copydecode.glossary import Glossary
-from copydecode.pipeline import process_chapter, rewrite_span_jobs
+from copydecode.pipeline import pack_kwargs, plan_chapter, process_chapter, rewrite_span_jobs
 from copydecode.spans import span_jobs_for, tag_text
 
 
@@ -26,6 +26,9 @@ class FakeEngine:
 
     def prefill(self, text: str) -> bool:
         return False
+
+    def count_prompt_tokens(self, text: str) -> int | None:
+        return None
 
     def generate(self, user, *, system, max_tokens, on_token=None, stop=None, **kwargs) -> str:
         self.calls += 1
@@ -49,6 +52,10 @@ class FakeEngine:
         return "\n\n".join(parts)
 
 
+def _packing(max_chars: int = 1800, num_ctx: int = 2048) -> dict:
+    return pack_kwargs(max_chars=max_chars, num_ctx=num_ctx, token_pack=False)
+
+
 class CopyDecodePipelineTests(unittest.TestCase):
     def test_rewrite_span_jobs_only_returns_replace_text(self) -> None:
         text = (
@@ -56,13 +63,13 @@ class CopyDecodePipelineTests(unittest.TestCase):
             "He could not help but smile. "
             "Then he walked toward the sect gate."
         )
-        program = tag_text(text, "polish", "auto", learned=False)
+        program = tag_text(text, "polish", "auto")
         jobs = span_jobs_for(0, program)
         self.assertTrue(jobs)
         engine = FakeEngine()
-        out = rewrite_span_jobs(engine, jobs, Glossary(), "", "", retries=0, num_ctx=2048)
+        out = rewrite_span_jobs(engine, jobs, retries=0, num_ctx=2048)
         self.assertTrue(engine.last_speculate)
-        stitched = program.stitched({job.span_index: repl for job, repl in zip(jobs, out)})
+        stitched = program.stitched({job.span_index: repl for job, repl in zip(jobs, out, strict=True)})
         self.assertTrue(stitched.startswith("The mountain wind was cold."))
         self.assertIn("EDIT::", stitched)
         keep_bits = [span.text for span in program.spans if span.kind == "KEEP"]
@@ -71,15 +78,12 @@ class CopyDecodePipelineTests(unittest.TestCase):
 
     def test_glossary_stays_in_system_prefix(self) -> None:
         text = "The mountain wind was cold. He could not help but smile. Then he walked on."
-        program = tag_text(text, "polish", "auto", learned=False)
+        program = tag_text(text, "polish", "auto")
         jobs = span_jobs_for(0, program)
         engine = FakeEngine()
         rewrite_span_jobs(
             engine,
             jobs,
-            Glossary(),
-            "",
-            "",
             retries=0,
             num_ctx=2048,
             glossary_block="Glossary (use these exact renderings):\n- Jindan → Golden Core",
@@ -101,21 +105,18 @@ class CopyDecodePipelineTests(unittest.TestCase):
             el["data-np-id"] = str(i)
         chapter = Chapter("c1", "c1.xhtml", "Ch 1", soup, segs)
         engine = FakeEngine()
+        plan = plan_chapter(chapter, "polish", "auto", Glossary(), copydecode=True, packing=_packing())
         with tempfile.TemporaryDirectory() as tmp:
-            ckpt = Checkpoint(Path(tmp) / "checkpoint.json", {"fingerprint": "t", "mode": "polish"})
+            ckpt = Checkpoint(Path(tmp) / "checkpoint.jsonl", {"fingerprint": "t", "mode": "polish"})
             packs, skipped = process_chapter(
-                chapter,
+                plan,
                 client=engine,  # type: ignore[arg-type]
                 mode="polish",
                 glossary=Glossary(),
-                max_chars=1800,
-                skip_mode="auto",
                 style="",
                 retries=0,
                 num_ctx=2048,
                 ckpt=ckpt,
-                copydecode=True,
-                learned=False,
             )
         self.assertGreaterEqual(packs, 1)
         self.assertGreaterEqual(skipped, 1)
@@ -136,10 +137,10 @@ class CopyDecodePipelineTests(unittest.TestCase):
             "He could not help but smile. "
             "Then he walked toward the sect gate with a steady step."
         )
-        program = tag_text(text, "polish", "auto", learned=False)
+        program = tag_text(text, "polish", "auto")
         jobs = span_jobs_for(0, program)
         engine = FakeEngine()
-        rewrite_span_jobs(engine, jobs, Glossary(), "", "", retries=0, num_ctx=4096)
+        rewrite_span_jobs(engine, jobs, retries=0, num_ctx=4096)
         dirty_chars = sum(len(job.text) for job in jobs)
         self.assertLess(engine.last_max_tokens, max(200, int(len(text) * 0.55) + 80))
         self.assertLessEqual(
@@ -149,7 +150,7 @@ class CopyDecodePipelineTests(unittest.TestCase):
 
     def test_rewrite_span_jobs_keeps_original_on_hallucination(self) -> None:
         source = 'Jiang Kai\'s eyes narrowed: "Here we come."'
-        program = tag_text(source, "polish", "off", learned=False)
+        program = tag_text(source, "polish", "off")
         jobs = span_jobs_for(0, program)
         self.assertTrue(jobs)
 
@@ -165,7 +166,7 @@ class CopyDecodePipelineTests(unittest.TestCase):
                 )
 
         engine = HallucinationEngine()
-        out = rewrite_span_jobs(engine, jobs, Glossary(), "", "", retries=0, num_ctx=2048)
+        out = rewrite_span_jobs(engine, jobs, retries=0, num_ctx=2048)
         self.assertEqual(out, [job.text for job in jobs])
 
     def test_token_max_tokens_uses_replace_length(self) -> None:

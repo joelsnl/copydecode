@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def env_value(*names: str, default: str = "") -> str:
-    """First non-empty environment value. COPYDECODE_* wins over legacy NOVELPOLISHER_*."""
+    """First non-empty environment value among ``names``."""
     for name in names:
         raw = os.environ.get(name, "").strip()
         if raw:
@@ -15,20 +15,12 @@ def env_value(*names: str, default: str = "") -> str:
 
 
 def cache_dir() -> Path:
-    env = env_value("COPYDECODE_CACHE", "NOVELPOLISHER_CACHE")
+    env = env_value("COPYDECODE_CACHE")
     if env:
         path = Path(env)
+    elif platform.system() == "Windows":
+        path = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "copydecode"
     else:
-        if platform.system() == "Windows":
-            base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        else:
-            base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-        preferred = base / "copydecode"
-        legacy = base / "novelpolisher"
-        path = preferred if preferred.exists() or not legacy.exists() else legacy
+        path = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "copydecode"
     path.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def package_data_dir() -> Path:
-    return Path(__file__).resolve().parent / "data"

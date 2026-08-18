@@ -182,9 +182,8 @@ def tag_text(
     tag: str = "p",
     *,
     force_dirty: bool = False,
-    learned: bool | None = None,
 ) -> EditProgram:
-    """Seq2Edits program: KEEP clean clauses, REPLACE MTL. Optional CPU tagger."""
+    """Build a KEEP/REPLACE edit program: KEEP clean clauses, REPLACE MTL artifacts."""
     if not text:
         return EditProgram((Span("KEEP", ""),))
 
@@ -195,23 +194,10 @@ def tag_text(
     else:
         units = split_units(text)
 
-    use_learned = bool(learned) if learned is not None else True
-    tagger = None
-    if use_learned:
-        from copydecode.tagger import get_tagger
-
-        tagger = get_tagger()
-
     labeled: list[tuple[str, str, float]] = []
     for unit in units:
         score = mtl_score(unit, mode, glossary, tag)
-        if tagger is not None:
-            replace = tagger.is_replace(unit, mode, glossary, tag)
-            strength = tagger.strength(unit, mode, glossary, tag)
-        else:
-            replace = score >= replace_at
-            strength = float(score)
-        labeled.append((unit, "REPLACE" if replace else "KEEP", strength))
+        labeled.append((unit, "REPLACE" if score >= replace_at else "KEEP", float(score)))
 
     if skip_mode in {"off", "none"} and not any(kind == "REPLACE" for _u, kind, _s in labeled):
         return EditProgram((Span("REPLACE", text),))
@@ -337,10 +323,15 @@ def _pack_span_jobs_tokens(
 
 
 def trim_echo(output: str, source: str, before: str, after: str) -> str:
-    """Drop KEEP context the model echoed around a REPLACE span."""
+    """Drop KEEP context the model echoed around a REPLACE span.
+
+    ``before``/``after`` come from :func:`clip_context` and may carry an
+    ellipsis marker on the clipped side; the marker never appears in model
+    output, so it is stripped before comparing.
+    """
     text = output.strip()
-    before_s = before.strip()
-    after_s = after.strip()
+    before_s = before.strip().lstrip("…").strip()
+    after_s = after.strip().rstrip("…").strip()
     if before_s and text.startswith(before_s):
         text = text[len(before_s) :].lstrip()
     if after_s and text.endswith(after_s):

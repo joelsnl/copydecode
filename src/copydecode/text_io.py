@@ -1,4 +1,3 @@
-# Author: joelsnl
 """Plain text, Markdown, HTML, and JSON readers/writers."""
 
 from __future__ import annotations

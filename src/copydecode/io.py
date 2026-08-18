@@ -1,11 +1,28 @@
-# Author: joelsnl
-"""Load and write documents by suffix. KEEP/REPLACE itself does not care about file type."""
+"""Load and write documents by suffix.
+
+``READERS`` and ``WRITERS`` are plain registries keyed by format name, so a
+new file type only needs two callables:
+
+    READERS["fb2"] = load_fb2                       # (Path) -> Document
+    WRITERS["fb2"] = write_fb2                      # (Document, Path, rewrite_ids) -> None
+    FORMAT_ALIASES["fb2"] = "fb2"                   # accepted -f / suffix values
+    OUTPUT_EXTENSIONS["fb2"] = ".fb2"
+
+The KEEP/REPLACE pipeline itself never touches file formats.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
-from copydecode.document import OUTPUT_EXTENSIONS, Document, detect_format, normalize_format
+from copydecode.document import (
+    FORMAT_ALIASES,
+    OUTPUT_EXTENSIONS,
+    Document,
+    detect_format,
+    normalize_format,
+)
 from copydecode.docx_io import load_docx, write_docx
 from copydecode.epub_io import load_epub_document, write_epub, write_fresh_epub
 from copydecode.pdf_io import load_pdf, write_pdf
@@ -20,7 +37,19 @@ from copydecode.text_io import (
     write_txt,
 )
 
-READERS = {
+__all__ = [
+    "FORMAT_ALIASES",
+    "OUTPUT_EXTENSIONS",
+    "READERS",
+    "WRITERS",
+    "load_document",
+    "write_document",
+]
+
+Reader = Callable[[Path], Document]
+Writer = Callable[[Document, Path, "set[str] | None"], None]
+
+READERS: dict[str, Reader] = {
     "epub": load_epub_document,
     "pdf": load_pdf,
     "txt": load_txt,
@@ -29,6 +58,25 @@ READERS = {
     "docx": load_docx,
     "jsonl": lambda path: load_json_records(path, "jsonl"),
     "json": lambda path: load_json_records(path, "json"),
+}
+
+
+def _write_epub_out(doc: Document, dest: Path, rewrite_ids: set[str] | None) -> None:
+    if doc.fmt == "epub" and doc.payload is not None:
+        write_epub(doc.payload, doc.chapters, str(dest), rewrite_ids=rewrite_ids, source_path=doc.path)
+    else:
+        write_fresh_epub(doc.chapters, dest, doc.title or dest.stem)
+
+
+WRITERS: dict[str, Writer] = {
+    "epub": _write_epub_out,
+    "pdf": lambda doc, dest, _ids: write_pdf(doc.chapters, dest, doc.title or dest.stem),
+    "txt": lambda doc, dest, ids: write_txt(doc.chapters, dest, rewrite_ids=ids),
+    "md": lambda doc, dest, ids: write_markdown(doc.chapters, dest, rewrite_ids=ids),
+    "html": lambda doc, dest, _ids: write_html(doc, dest, doc.chapters),
+    "docx": lambda doc, dest, _ids: write_docx(doc, dest, doc.chapters),
+    "jsonl": lambda doc, dest, _ids: write_json_records(doc.chapters, dest, "jsonl"),
+    "json": lambda doc, dest, _ids: write_json_records(doc.chapters, dest, "json"),
 }
 
 
@@ -54,35 +102,7 @@ def write_document(
     out_fmt = normalize_format(fmt) if fmt else detect_format(dest) if dest.suffix else doc.fmt
     if not dest.suffix:
         dest = dest.with_suffix(OUTPUT_EXTENSIONS.get(out_fmt, f".{out_fmt}"))
-    chapters = doc.chapters
-    if out_fmt == "epub":
-        if doc.fmt == "epub" and doc.payload is not None:
-            write_epub(
-                doc.payload,
-                chapters,
-                str(dest),
-                rewrite_ids=rewrite_ids,
-                source_path=doc.path,
-            )
-            return
-        write_fresh_epub(chapters, dest, doc.title or dest.stem)
-        return
-    if out_fmt == "pdf":
-        write_pdf(chapters, dest, doc.title or dest.stem)
-        return
-    if out_fmt == "txt":
-        write_txt(chapters, dest, rewrite_ids=rewrite_ids)
-        return
-    if out_fmt == "md":
-        write_markdown(chapters, dest, rewrite_ids=rewrite_ids)
-        return
-    if out_fmt == "html":
-        write_html(doc, dest, chapters)
-        return
-    if out_fmt == "docx":
-        write_docx(doc, dest, chapters)
-        return
-    if out_fmt in {"jsonl", "json"}:
-        write_json_records(chapters, dest, out_fmt)
-        return
-    raise ValueError(f"Unsupported output format: {out_fmt}")
+    writer = WRITERS.get(out_fmt)
+    if writer is None:
+        raise ValueError(f"Unsupported output format: {out_fmt}")
+    writer(doc, dest, rewrite_ids)

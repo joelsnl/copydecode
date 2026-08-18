@@ -5,10 +5,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-.polisher/
+.copydecode/
 *.epub
 !tests/fixtures/*.epub
 .DS_Store
 Thumbs.db
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/

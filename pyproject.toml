@@ -1,6 +1,6 @@
 [project]
 name = "copydecode"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local KEEP/REPLACE copy-edit and any-language→English translation for EPUB, PDF, text, HTML, and DOCX."
 readme = "README.md"
 license = { text = "AGPL-3.0-or-later" }
@@ -9,6 +9,10 @@ requires-python = ">=3.10"
 classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Text Processing",
 ]
 keywords = [
@@ -39,6 +43,7 @@ Repository = "https://github.com/joelsnl/copydecode"
 [project.optional-dependencies]
 nllb = ["ctranslate2>=4.5", "transformers>=4.44", "sentencepiece>=0.2"]
 pack = ["tokenizers>=0.20", "huggingface_hub>=0.24"]
+dev = ["ruff>=0.6"]
 
 [project.scripts]
 copydecode = "copydecode.cli:main"
@@ -50,5 +55,10 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-copydecode = ["data/*.json"]
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]

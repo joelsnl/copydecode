@@ -102,25 +102,37 @@ def build_span_user_prompt(
 
 
 def parse_numbered(text: str, expected: int) -> list[str] | None:
+    """Map ``[n]`` blocks in model output back to input positions.
+
+    Assignment follows the labels the model wrote, not the order blocks appear
+    in, so reordered or partially repeated output cannot land in the wrong
+    slot. Duplicate labels keep the first occurrence. Unlabeled output is only
+    accepted positionally when the model produced no labels at all.
+    """
     cleaned = text.strip()
     cleaned = re.sub(r"\*+\[(\d+)\]\*+", r"[\1]", cleaned)
-    matches = NUMBERED_RE.findall(cleaned)
-    values = [_clean_span_block(m[1]) for m in matches]
-    values = [v for v in values if v]
+    found: dict[int, str] = {}
+    for number, body in NUMBERED_RE.findall(cleaned):
+        index = int(number)
+        value = _clean_span_block(body)
+        if value and 1 <= index <= expected and index not in found:
+            found[index] = value
+
     if expected == 1:
-        if values:
-            return [values[0]]
+        if found:
+            return [found[min(found)]]
         stripped = _clean_span_block(re.sub(r"^\[1\]\s*", "", cleaned))
         return [stripped] if stripped else None
 
-    if len(values) == expected:
-        return values
+    if len(found) == expected:
+        return [found[i] for i in range(1, expected + 1)]
 
-    blanks = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
-    blanks = [_clean_span_block(re.sub(r"^\[\d+\]\s*", "", p)) for p in blanks]
-    blanks = [p for p in blanks if p]
-    if len(blanks) == expected:
-        return blanks
+    if not found:
+        blanks = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
+        blanks = [_clean_span_block(p) for p in blanks]
+        blanks = [p for p in blanks if p]
+        if len(blanks) == expected:
+            return blanks
     return None
 
 

@@ -1,4 +1,3 @@
-# Author: joelsnl
 """DOCX paragraph round-trip. Rewritten paragraphs flatten run-level bold/italic."""
 
 from __future__ import annotations
@@ -7,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from copydecode.document import Chapter, Document, Segment, chapter_from_blocks
+from copydecode.errors import DocumentError
 
 
 def _paragraphs(doc: Any) -> list[Any]:
@@ -33,7 +33,7 @@ def load_docx(path: Path) -> Document:
     try:
         from docx import Document as DocxDocument
     except ImportError as exc:
-        raise RuntimeError("DOCX support needs python-docx. Install with: pip install python-docx") from exc
+        raise DocumentError("DOCX support needs python-docx. Install with: pip install python-docx") from exc
     doc = DocxDocument(str(path))
     paras = _paragraphs(doc)
     chapters: list[Chapter] = []
@@ -103,7 +103,7 @@ def write_docx(doc: Document, output: Path, chapters: list[Chapter] | None = Non
     try:
         from docx import Document as DocxDocument
     except ImportError as exc:
-        raise RuntimeError("DOCX support needs python-docx. Install with: pip install python-docx") from exc
+        raise DocumentError("DOCX support needs python-docx. Install with: pip install python-docx") from exc
     fresh = DocxDocument()
     if doc.title:
         fresh.add_heading(doc.title, level=1)
