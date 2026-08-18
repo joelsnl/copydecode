@@ -1,6 +1,6 @@
 [project]
 name = "copydecode"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local KEEP/REPLACE copy-edit and any-language→English translation for EPUB, PDF, text, HTML, and DOCX."
 readme = "README.md"
 license = "AGPL-3.0-or-later"

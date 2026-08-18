@@ -7,7 +7,6 @@ import json
 import os
 import platform
 import re
-import shutil
 import stat
 import subprocess
 import tarfile
@@ -19,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlparse
 
 import httpx
 from rich.console import Console
@@ -32,6 +32,10 @@ GITHUB_RELEASES = "https://api.github.com/repos/ggml-org/llama.cpp/releases/late
 USER_AGENT = "copydecode"
 DEFAULT_PORT = 8080
 DEFAULT_HOST = "http://127.0.0.1:8080"
+# Initial download URL hosts only. Redirects (GitHub/HF CDNs) are allowed
+# because every download requires a sha256 and fails closed on mismatch.
+_ALLOWED_DOWNLOAD_HOSTS = frozenset({"github.com", "huggingface.co"})
+
 
 class GgufSpec(NamedTuple):
     alias: str
@@ -274,9 +278,6 @@ def find_llama_server(root: Path | None = None) -> Path | None:
         path = Path(env)
         if path.is_file():
             return path
-    which = shutil.which("llama-server")
-    if which:
-        return Path(which)
     names = ("llama-server.exe", "llama-server")
     search_roots = [root] if root else [cache_dir() / "llama-server"]
     for base in search_roots:
@@ -353,13 +354,27 @@ def _stream_download(url: str, tmp: Path, offset: int, digest, label: str, log: 
                         progress.advance(task, len(chunk))
 
 
-def download_file(url: str, dest: Path, log: Log = _noop_log, *, expected_sha256: str = "") -> None:
+def _assert_download_url(url: str) -> None:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or host not in _ALLOWED_DOWNLOAD_HOSTS:
+        raise EngineError(
+            f"Refusing download from {url!r}. Only https://github.com and "
+            "https://huggingface.co URLs are allowed (CDN redirects are fine; sha256 is required)."
+        )
+
+
+def download_file(url: str, dest: Path, log: Log = _noop_log, *, expected_sha256: str) -> None:
     """Stream ``url`` to ``dest``.
 
     Interrupted downloads resume from the ``.partial`` file when the server
-    honors Range requests. When a sha256 is supplied the whole file is hashed
-    while streaming and a mismatch deletes the partial and raises.
+    honors Range requests. sha256 is required; a mismatch deletes the partial
+    and raises. Initial URL host is allowlisted; redirects may hit GitHub/HF CDNs.
     """
+    _assert_download_url(url)
+    sha = expected_sha256.strip().lower()
+    if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+        raise EngineError("Refusing download: expected_sha256 must be 64 hex characters.")
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".partial")
     offset = tmp.stat().st_size if tmp.exists() else 0
@@ -373,15 +388,14 @@ def download_file(url: str, dest: Path, log: Log = _noop_log, *, expected_sha256
         tmp.unlink(missing_ok=True)
         digest = hashlib.sha256()
         _stream_download(url, tmp, 0, digest, dest.name, log)
-    if expected_sha256:
-        actual = digest.hexdigest()
-        if actual.lower() != expected_sha256.lower():
-            tmp.unlink(missing_ok=True)
-            raise EngineError(
-                f"Checksum mismatch for {dest.name}: expected sha256 {expected_sha256}, "
-                f"got {actual}. The partial file was deleted; run again to re-download."
-            )
-        log(f"sha256 verified for {dest.name}")
+    actual = digest.hexdigest()
+    if actual.lower() != sha:
+        tmp.unlink(missing_ok=True)
+        raise EngineError(
+            f"Checksum mismatch for {dest.name}: expected sha256 {sha}, "
+            f"got {actual}. The partial file was deleted; run again to re-download."
+        )
+    log(f"sha256 verified for {dest.name}")
     tmp.replace(dest)
     log(f"Saved {dest} ({dest.stat().st_size / (1024 * 1024):.1f} MB)")
 

@@ -281,7 +281,7 @@ class DownloadTests(unittest.TestCase):
             dest = Path(tmp) / "asset.zip"
             with patch("copydecode.serve._stream_download", side_effect=self._fake_stream(payload)):
                 download_file(
-                    "https://example.invalid/a.zip",
+                    "https://huggingface.co/example/a.zip",
                     dest,
                     expected_sha256=hashlib.sha256(payload).hexdigest(),
                 )
@@ -292,10 +292,28 @@ class DownloadTests(unittest.TestCase):
             dest = Path(tmp) / "asset.zip"
             with patch("copydecode.serve._stream_download", side_effect=self._fake_stream(b"llama")):
                 with self.assertRaises(EngineError) as ctx:
-                    download_file("https://example.invalid/a.zip", dest, expected_sha256="0" * 64)
+                    download_file(
+                        "https://huggingface.co/example/a.zip",
+                        dest,
+                        expected_sha256="0" * 64,
+                    )
             self.assertIn("Checksum mismatch", str(ctx.exception))
             self.assertFalse(dest.exists())
             self.assertFalse(dest.with_suffix(dest.suffix + ".partial").exists())
+
+    def test_refuses_non_allowlisted_host(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "asset.zip"
+            with self.assertRaises(EngineError) as ctx:
+                download_file("https://evil.example/payload", dest, expected_sha256="a" * 64)
+            self.assertIn("Refusing download", str(ctx.exception))
+            self.assertFalse(dest.exists())
+
+    def test_refuses_http(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "asset.zip"
+            with self.assertRaises(EngineError):
+                download_file("http://github.com/a.zip", dest, expected_sha256="a" * 64)
 
     def test_release_assets_extract_github_digest(self) -> None:
         release = {

@@ -60,7 +60,8 @@ Read this before your first bug report. None of these are hidden; they are trade
 **Download machinery**
 
 - `serve.py` hardcodes three Qwen2.5 GGUF URLs (3B/7B/14B Q4_K_M) and matches GitHub release assets by literal filename suffixes, including CUDA/ROCm version strings (`cuda-12.4`, `cuda-13.3`, `rocm-7.2`). These strings **will** rot when llama.cpp renames its artifacts, and only a human will notice.
-- Downloads resume via Range requests. llama.cpp GitHub assets are sha256-verified and **refused** if the release has no digest. The three bundled GGUFs are pinned to known hashes; a truncated or swapped file fails closed. The 7B and 14B files come from bartowski because the official Qwen uploads of those sizes are sharded and this tool does not stitch shards.
+- Downloads resume via Range requests. Every download requires a 64-hex sha256 and an `https://github.com` or `https://huggingface.co` URL; CDN redirects are allowed, checksum mismatch fails closed. llama.cpp GitHub assets are refused if the release has no digest. The three bundled GGUFs are pinned. The 7B and 14B files come from bartowski because the official Qwen uploads of those sizes are sharded.
+- `pip install` / `import copydecode` does not download or execute anything. llama-server is started only by `copydecode serve` or `auto_serve=True`, and never from `PATH` (cache or `COPYDECODE_LLAMA_SERVER` only). Publish is OIDC Trusted Publishing from `publish.yml` on `v*.*.*` tags; GitHub Actions are pinned to commit SHAs. There is no PyPI API token to steal. That does not stop a compromised GitHub account with push rights — nothing does.
 - Hardware sizing (`hardware.py`) is a table of VRAM tiers and name-regex parameter guessing. A model whose size is not in its name gets conservative defaults and a shrug.
 
 **Concurrency**
@@ -145,6 +146,6 @@ Everything intentional raises a `copydecode.CopydecodeError` subclass (`EngineEr
 
 **Publishing to PyPI** is Trusted Publishing from `.github/workflows/publish.yml`. Pushing a `v*` tag (or `workflow_dispatch`) builds the wheel on GitHub and uploads it. PyPI does not clone the repo; it stores that wheel. There is no API token in this repo.
 
-First-time setup: PyPI account + 2FA, pending publisher (`joelsnl` / `copydecode` / `publish.yml` / environment `pypi`), GitHub Environment named `pypi`. After that: `git tag v0.3.1 && git push origin v0.3.1`.
+First-time setup: PyPI account + 2FA, pending publisher (`joelsnl` / `copydecode` / `publish.yml` / environment `pypi`), GitHub Environment named `pypi`. After that: bump the version in `pyproject.toml` and `src/copydecode/__init__.py`, then `git tag v0.3.2 && git push origin v0.3.2`.
 
 License: **AGPL-3.0-or-later**. Private use anywhere, including at work, is unconditionally fine. Distribution or network services built on modified versions owe source under the AGPL. Commercial exceptions: open a GitHub issue titled `Commercial license`.

@@ -21,7 +21,7 @@ from copydecode.glossary import Glossary, Term, load_glossary_file
 from copydecode.io import READERS, WRITERS, load_document, write_document
 from copydecode.pipeline import JobConfig, run_job
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "Chapter",
