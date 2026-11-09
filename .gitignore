@@ -13,3 +13,8 @@ Thumbs.db
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Claude Code local files: personal settings and "don't ask again" approvals can contain secrets
+**/.claude/settings.local.json
+CLAUDE.local.md
+**/.claude/worktrees/
